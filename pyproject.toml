@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krusch-fs"
-version = "0.1.0"
+version = "0.3.1"
 description = "Standalone Opt-In OS Filesystem & KruschNexus Page-Anchored Memory MCP Server"
 readme = "README.md"
 authors = [{ name = "kruschdev", email = "kruschdev@users.noreply.github.com" }]

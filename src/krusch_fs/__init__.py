@@ -5,7 +5,7 @@ Standalone, opt-in OS Filesystem & KruschNexus Page-Anchored Memory MCP Server
 across all computers on the homelab fleet.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.1"
 
 from .models import (
     WorkspaceZone,

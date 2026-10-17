@@ -8,9 +8,10 @@ Provides zero-egress local embeddings (`INV-1`):
 
 import re
 import math
+import json
 import hashlib
+import urllib.request
 from typing import List
-import requests
 
 TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 
@@ -52,15 +53,18 @@ def embed_text(
     """Generate a 1024-d embedding vector locally with zero cloud egress."""
     if backend == "ollama":
         try:
-            resp = requests.post(
+            req = urllib.request.Request(
                 f"{ollama_url.rstrip('/')}/api/embeddings",
-                json={"model": model, "prompt": text[:4000]},
-                timeout=3.0,
+                data=json.dumps({"model": model, "prompt": text[:4000]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            if resp.status_code == 200:
-                vec = resp.json().get("embedding")
-                if isinstance(vec, list) and len(vec) == dim:
-                    return vec
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    vec = data.get("embedding")
+                    if isinstance(vec, list) and len(vec) == dim:
+                        return vec
         except Exception:
             pass
     return _deterministic_token_vector(text, dim=dim)

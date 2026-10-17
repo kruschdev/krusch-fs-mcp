@@ -295,6 +295,7 @@ class KruschFSClient:
                     max_chars=1800,
                     overlap_chars=150,
                 )
+                page_full_text = page_data.text or ""
                 for c_idx, nc in enumerate(nexus_chunks):
                     c_cit = format_citation(
                         filename=file_name,
@@ -303,6 +304,16 @@ class KruschFSClient:
                         printed_page=nc.printed_page or page_data.printed_page,
                         locator=nc.locator or page_data.locator,
                         header=nc.header or sec_hdr,
+                    )
+                    c_start = nc.char_start
+                    c_end = nc.char_end
+                    if (c_start is None or c_end is None) and nc.text and nc.text in page_full_text:
+                        c_start = page_full_text.find(nc.text)
+                        c_end = c_start + len(nc.text)
+                    can_slice = (
+                        c_start is not None
+                        and c_end is not None
+                        and page_full_text[c_start:c_end] == nc.text
                     )
                     db.add(
                         FSChunk(
@@ -315,10 +326,10 @@ class KruschFSClient:
                             citation=c_cit,
                             header=nc.header or sec_hdr,
                             locator=nc.locator or page_data.locator,
-                            content=nc.text,
+                            content="" if can_slice else nc.text,
                             source_hash=nc.source_hash,
-                            char_start=nc.char_start,
-                            char_end=nc.char_end,
+                            char_start=c_start,
+                            char_end=c_end,
                             bbox=json.dumps(nc.bbox) if nc.bbox else None,
                             embedding=self._embed(f"{sec_hdr or ''} {nc.text}"),
                         )
@@ -1210,7 +1221,15 @@ class KruschFSClient:
                     f_obj = files_map.get(c.file_id)
                     if not f_obj:
                         continue
-                    searchable = f"{f_obj.host_node} {f_obj.file_name} {c.header or ''} {c.locator or ''} {c.content}"
+                    p_obj = pages_map.get((c.file_id, c.page_number))
+                    chunk_text = c.content
+                    if not chunk_text and p_obj and p_obj.page_text:
+                        if c.char_start is not None and c.char_end is not None:
+                            chunk_text = p_obj.page_text[c.char_start:c.char_end]
+                        else:
+                            chunk_text = p_obj.page_text
+                    chunk_text = chunk_text or ""
+                    searchable = f"{f_obj.host_node} {f_obj.file_name} {c.header or ''} {c.locator or ''} {chunk_text}"
                     lex = _lexical_score(searchable)
                     dense = cosine_similarity(q_vec, c.embedding or [])
                     raw_score = (0.50 * dense) + (0.50 * lex)
@@ -1230,7 +1249,7 @@ class KruschFSClient:
                             "raw_score": raw_score,
                             "match_source": "page_chunk",
                             "match_reasons": ["hybrid_chunk_match"],
-                            "snippet": c.content[:300].strip(),
+                            "snippet": chunk_text[:300].strip(),
                             "header": c.header,
                             "locator": c.locator,
                             "citation": c.citation,
@@ -1241,7 +1260,7 @@ class KruschFSClient:
                     else:
                         is_memory_upgrade = existing["match_source"] == "page_memory"
                         if raw_score > existing["raw_score"] and not is_memory_upgrade:
-                            existing["snippet"] = c.content[:300].strip()
+                            existing["snippet"] = chunk_text[:300].strip()
                             existing["header"] = c.header
                             existing["locator"] = c.locator
                             existing["citation"] = c.citation

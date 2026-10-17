@@ -1,6 +1,6 @@
 # KruschFS MCP (`krusch-fs`)
 
-> **PGit + KruschNexus for Your Operating System & Multi-Node Fleet** — Standalone, opt-in OS Filesystem & Page-Anchored Memory MCP Server (`v0.3.0-alpha`).
+> **PGit + KruschNexus for Your Operating System & Multi-Node Fleet** — Standalone, opt-in OS Filesystem & Page-Anchored Memory MCP Server (`v0.3.1`).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB.svg)](pyproject.toml)
@@ -16,6 +16,7 @@
 - Consumes `krusch_nexus` in **Zero-Config Library Mode** (`parse_file`, `chunk_document_pages`, `format_citation`) without running duplicate OCR workers or copying files into a staging vault.
 - Every indexed file (PDF, DOCX, CSV, HTML, Markdown, systemd `.service`, `.conf`, `/etc/fstab`, and redacted `.env`) is segmented into deterministic 1-based pages (`fs_pages`) with a per-page SHA-256 `page_hash`.
 - **Single-Page Delta Re-Indexing**: Editing page 42 of a 120-page PDF or section 3 of a Markdown runbook only re-embeds page 42 and only flags memories anchored to page 42 as `is_drifted=True`, leaving pages `1..41` and `43..120` untouched.
+- **Pointer-Slice Chunk Deduplication (`v0.3.1`)**: Because `fs_pages.page_text` already stores the normalized text for each 1-based page, `fs_chunks` stores only `char_start..char_end` offsets (`content=""`) whenever a chunk is a clean slice of `page_text`, slicing snippets in-memory during `search()` to eliminate 2x SQLite database bloat.
 - **Inode Move & Rename Resilience**: Moving or renaming a file on the same filesystem updates `file_path` and citations in-place via `(host_node, device_id, inode, file_hash)` without re-parsing or losing page-anchored memories.
 
 ### 2. 3-Zone Workspace Isolation & Zero-Trust Privacy Shield
