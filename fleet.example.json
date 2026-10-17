@@ -1,0 +1,35 @@
+{
+  "workstation": {
+    "local": true,
+    "role": "Primary Workstation",
+    "ssh_targets": [],
+    "default_roots": [
+      "/etc/systemd/system",
+      "/etc/fstab",
+      "/etc/hosts",
+      "~/Documents",
+      "~/Downloads"
+    ]
+  },
+  "compute-node-01": {
+    "local": false,
+    "role": "GPU Compute Worker",
+    "ssh_targets": ["compute-node-01", "192.0.2.10"],
+    "default_roots": [
+      "/etc/systemd/system",
+      "/etc/fstab",
+      "/etc/hosts",
+      "/home/ubuntu/Documents"
+    ]
+  },
+  "storage-node-01": {
+    "local": false,
+    "role": "Storage & Database Host",
+    "ssh_targets": ["storage-node-01", "198.51.100.20"],
+    "default_roots": [
+      "/etc/systemd/system",
+      "/etc/fstab",
+      "/etc/hosts"
+    ]
+  }
+}

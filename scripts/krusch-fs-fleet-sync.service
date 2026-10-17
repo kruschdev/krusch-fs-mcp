@@ -1,0 +1,9 @@
+[Unit]
+Description=KruschFS Multi-Node Fleet Synchronization
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment="KRUSCH_FS_DB_URL=sqlite:///%h/.krusch-fs/fs_memory.db"
+Environment="KRUSCH_FS_FLEET_CONFIG=%h/.krusch-fs/fleet.json"
+ExecStart=krusch-fs sync-fleet

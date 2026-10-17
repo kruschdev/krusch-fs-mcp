@@ -1,0 +1,11 @@
+[Unit]
+Description=Run KruschFS Multi-Node Fleet Sync Every 30 Minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+OnCalendar=*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
