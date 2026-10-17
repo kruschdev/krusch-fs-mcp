@@ -172,7 +172,7 @@ def should_ignore_path(path_str: str) -> bool:
     if (
         bname.startswith((".lock.", ".~lock.", "~$"))
         or bname.endswith((".swp", ".tmp", ".part", ".crdownload"))
-        or bname == ".DS_Store"
+        or bname in (".DS_Store", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock", "poetry.lock", "uv.lock", "bun.lockb")
     ):
         return True
     for prefix in IGNORED_PATH_PREFIXES:
