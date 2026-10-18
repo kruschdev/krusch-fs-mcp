@@ -202,6 +202,8 @@ class KruschFSClient:
             for p in db.query(FSPage).filter(FSPage.file_id == fs_file.id).all()
         }
         seen_page_numbers = set()
+        live_pages_by_num: Dict[int, FSPage] = {}
+        changed_or_removed_pages = set()
 
         for page_idx, page_data in enumerate(parsed_res.pages, start=1):
             p_num = page_data.index or page_idx
@@ -222,10 +224,12 @@ class KruschFSClient:
 
             old_page = existing_pages.get(p_num)
             if old_page and old_page.page_hash == p_hash:
+                live_pages_by_num[p_num] = old_page
                 if _report is not None:
                     _report.pages_unchanged_skipped += 1
                 continue
 
+            changed_or_removed_pages.add(p_num)
             if old_page is None:
                 fs_page = FSPage(
                     file_id=fs_file.id,
@@ -266,26 +270,7 @@ class KruschFSClient:
                 ).delete()
                 db.flush()
 
-                anchored_memories = (
-                    db.query(PageMemory)
-                    .filter(
-                        PageMemory.file_id == fs_file.id,
-                        PageMemory.page_number == p_num,
-                        PageMemory.auto_extracted == False,  # noqa: E712
-                    )
-                    .all()
-                )
-                for mem in anchored_memories:
-                    if mem.quoted_sentence and mem.quoted_sentence in (page_data.text or ""):
-                        pos = page_data.text.find(mem.quoted_sentence)
-                        mem.anchor_page_hash = p_hash
-                        mem.char_start = pos
-                        mem.char_end = pos + len(mem.quoted_sentence)
-                        mem.is_drifted = False
-                    else:
-                        mem.is_drifted = True
-                        if _report is not None:
-                            _report.memories_flagged_drifted += 1
+            live_pages_by_num[p_num] = fs_page
 
             if privacy not in (PrivacyLevel.VAULT_LOCKED,):
                 nexus_chunks = chunk_document_pages(
@@ -367,16 +352,75 @@ class KruschFSClient:
 
         for old_p_num, old_p in existing_pages.items():
             if old_p_num not in seen_page_numbers:
-                trailing_mems = (
-                    db.query(PageMemory)
-                    .filter(PageMemory.file_id == fs_file.id, PageMemory.page_number == old_p_num)
-                    .all()
+                changed_or_removed_pages.add(old_p_num)
+                db.query(PageMemory).filter(
+                    PageMemory.file_id == fs_file.id,
+                    PageMemory.page_number == old_p_num,
+                    PageMemory.auto_extracted == True,  # noqa: E712
+                ).delete()
+                db.delete(old_p)
+        db.flush()
+
+        # Reconcile pinned PageMemory anchors:
+        # 1) Same-page re-anchoring (if quote still exists on mem.page_number)
+        # 2) Cross-page relocation ("same text, new page" when insertions/deletions shift pages)
+        # 3) True content drift (STALE_DRIFT only when quoted_sentence no longer exists on any page)
+        if changed_or_removed_pages:
+            pinned_memories = (
+                db.query(PageMemory)
+                .filter(
+                    PageMemory.file_id == fs_file.id,
+                    PageMemory.auto_extracted == False,  # noqa: E712
                 )
-                for tm in trailing_mems:
-                    tm.is_drifted = True
+                .all()
+            )
+            for mem in pinned_memories:
+                if mem.page_number not in changed_or_removed_pages and not mem.is_drifted:
+                    continue
+
+                curr_page = live_pages_by_num.get(mem.page_number)
+                if curr_page is not None and mem.quoted_sentence and mem.quoted_sentence in (curr_page.page_text or ""):
+                    pos = curr_page.page_text.find(mem.quoted_sentence)
+                    mem.page_id = curr_page.id
+                    mem.printed_page = curr_page.printed_page
+                    mem.citation = curr_page.citation
+                    mem.locator = curr_page.locator
+                    mem.anchor_page_hash = curr_page.page_hash
+                    mem.char_start = pos
+                    mem.char_end = pos + len(mem.quoted_sentence)
+                    mem.is_drifted = False
+                    continue
+
+                relocated = False
+                if mem.quoted_sentence:
+                    candidate_pages = sorted(
+                        (p for p_num, p in live_pages_by_num.items() if p_num != mem.page_number),
+                        key=lambda p: (abs(p.page_number - mem.page_number), p.page_number),
+                    )
+                    for cand_page in candidate_pages:
+                        cand_text = cand_page.page_text or ""
+                        if mem.quoted_sentence in cand_text:
+                            pos = cand_text.find(mem.quoted_sentence)
+                            mem.page_id = cand_page.id
+                            mem.page_number = cand_page.page_number
+                            mem.printed_page = cand_page.printed_page
+                            mem.citation = cand_page.citation
+                            mem.locator = cand_page.locator
+                            mem.anchor_page_hash = cand_page.page_hash
+                            mem.char_start = pos
+                            mem.char_end = pos + len(mem.quoted_sentence)
+                            mem.is_drifted = False
+                            if _report is not None:
+                                _report.memories_relocated += 1
+                            relocated = True
+                            break
+
+                if not relocated:
+                    if curr_page is None:
+                        mem.page_id = None
+                    mem.is_drifted = True
                     if _report is not None:
                         _report.memories_flagged_drifted += 1
-                db.delete(old_p)
 
         db.commit()
         db.refresh(fs_file)
@@ -666,6 +710,32 @@ class KruschFSClient:
                             host_node=node_name,
                             _report=report,
                         )
+                env_dirs = [current_dir]
+                projects_sub = os.path.join(current_dir, "projects")
+                if os.path.isdir(projects_sub):
+                    try:
+                        for sub in sorted(os.listdir(projects_sub)):
+                            sub_p = os.path.join(projects_sub, sub)
+                            if os.path.isdir(sub_p):
+                                env_dirs.append(sub_p)
+                    except Exception:
+                        pass
+                for ed in env_dirs:
+                    try:
+                        for fn in sorted(os.listdir(ed)):
+                            low = fn.lower()
+                            if low == ".env" or low.startswith(".env.") or low.endswith(".env"):
+                                ep = os.path.join(ed, fn)
+                                if os.path.isfile(ep) and not os.path.islink(ep):
+                                    report.files_discovered += 1
+                                    self.index_file(
+                                        ep,
+                                        workspace=WorkspaceZone.SYSTEM_CONFIG.value,
+                                        host_node=node_name,
+                                        _report=report,
+                                    )
+                    except Exception:
+                        pass
                 dirnames[:] = []
                 continue
 
@@ -1117,6 +1187,8 @@ class KruschFSClient:
         host_node: Optional[str] = None,
         include_memories: bool = True,
         limit: int = 5,
+        node: Optional[str] = None,
+        top_k: Optional[int] = None,
     ) -> List[PageSearchHit]:
         """
         Hybrid RRF Search (`krusch_fs_search`) across all fleet nodes (or a specific `host_node`).
@@ -1125,6 +1197,19 @@ class KruschFSClient:
         if not q_clean:
             return []
 
+        effective_node = host_node or node
+        effective_limit = top_k if top_k is not None else limit
+        cat_norm = (category or "").strip().lower()
+        mem_category: Optional[str] = category
+        if cat_norm in ("", "all", "*"):
+            mem_category = None
+        elif cat_norm in ("systemd", "config", "env", "system_config", "service"):
+            workspace = workspace or WorkspaceZone.SYSTEM_CONFIG.value
+            mem_category = None
+        elif cat_norm in ("docs", "user_docs", "document", "documents"):
+            workspace = workspace or WorkspaceZone.USER_DOCS.value
+            mem_category = None
+
         q_vec = self._embed(q_clean)
         q_tokens = set(QUERY_TOKEN_RE.findall(q_clean.lower()))
         now_ts = time.time()
@@ -1132,8 +1217,8 @@ class KruschFSClient:
         db = self.SessionLocal()
         try:
             file_q = db.query(FSFile).filter(FSFile.is_deleted == False)  # noqa: E712
-            if host_node and host_node != "all":
-                file_q = file_q.filter(FSFile.host_node == host_node)
+            if effective_node and effective_node != "all":
+                file_q = file_q.filter(FSFile.host_node == effective_node)
             if workspace and workspace != "all":
                 file_q = file_q.filter(FSFile.workspace == workspace)
             if path_prefix:
@@ -1173,7 +1258,7 @@ class KruschFSClient:
 
             if include_memories:
                 for m in all_mems:
-                    if category and m.category != category:
+                    if mem_category and m.category != mem_category:
                         continue
                     f_obj = files_map.get(m.file_id)
                     if not f_obj:
@@ -1215,7 +1300,7 @@ class KruschFSClient:
                             "char_end": m.char_end,
                         }
 
-            if not category:
+            if not mem_category:
                 chunks = db.query(FSChunk).filter(FSChunk.file_id.in_(valid_file_ids)).all()
                 for c in chunks:
                     f_obj = files_map.get(c.file_id)
@@ -1313,7 +1398,7 @@ class KruschFSClient:
                 )
 
             hits.sort(key=lambda h: h.score, reverse=True)
-            return hits[: max(1, int(limit))]
+            return hits[: max(1, int(effective_limit))]
         finally:
             db.close()
 
@@ -1327,23 +1412,39 @@ class KruschFSClient:
         find_duplicates: bool = False,
         host_node: Optional[str] = None,
         limit: int = 25,
+        node: Optional[str] = None,
+        category: Optional[str] = None,
+        min_size_bytes: Optional[int] = None,
     ) -> List[FileLocationHit]:
         """Fast Tier-A metadata & inode locator across the fleet (`krusch_fs_locate`)."""
+        effective_node = host_node or node
+        cat_norm = (category or "").strip().lower()
+        if cat_norm in ("systemd", "config", "env", "system_config", "service") and not workspace:
+            workspace = WorkspaceZone.SYSTEM_CONFIG.value
+        elif cat_norm in ("docs", "user_docs", "document", "documents") and not workspace:
+            workspace = WorkspaceZone.USER_DOCS.value
+
         db = self.SessionLocal()
         try:
             q = db.query(FSFile).filter(FSFile.is_deleted == False)  # noqa: E712
-            if host_node and host_node != "all":
-                q = q.filter(FSFile.host_node == host_node)
+            if effective_node and effective_node != "all":
+                q = q.filter(FSFile.host_node == effective_node)
             if workspace and workspace != "all":
                 q = q.filter(FSFile.workspace == workspace)
             if pattern:
-                pat = f"%{pattern.strip()}%"
-                q = q.filter((FSFile.file_name.ilike(pat)) | (FSFile.file_path.ilike(pat)))
+                p_clean = pattern.strip()
+                if p_clean not in ("*", "**", "*.*", ""):
+                    sql_pat = p_clean.replace("*", "%").replace("?", "_").strip("%")
+                    if sql_pat:
+                        pat = f"%{sql_pat}%"
+                        q = q.filter((FSFile.file_name.ilike(pat)) | (FSFile.file_path.ilike(pat)))
             if extension:
                 ext_norm = extension if extension.startswith(".") else f".{extension}"
                 q = q.filter(FSFile.extension == ext_norm.lower())
             if min_size_mb is not None:
                 q = q.filter(FSFile.size_bytes >= int(float(min_size_mb) * 1024 * 1024))
+            elif min_size_bytes is not None and int(min_size_bytes) > 0:
+                q = q.filter(FSFile.size_bytes >= int(min_size_bytes))
             if modified_within_hours is not None:
                 cutoff = time.time() - (float(modified_within_hours) * 3600.0)
                 q = q.filter(FSFile.mtime >= cutoff)

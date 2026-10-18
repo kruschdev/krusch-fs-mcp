@@ -165,6 +165,56 @@ def test_per_page_delta_reindexing_and_granular_memory_drift(fs_env):
     assert p3_after.memories[0].is_drifted is True
 
 
+def test_cross_page_insertion_relocates_memory_without_false_drift(fs_env):
+    client, root = fs_env
+    runbook = root / "shift_runbook.md"
+    runbook.write_text(
+        "# Page 1: Node Topology\n"
+        "workstation-01 is the primary orchestrator at 192.0.2.10.\n\n"
+        "# Page 2: Storage Policy\n"
+        "OS drives are strictly protected from Docker image storage.\n",
+        encoding="utf-8",
+    )
+
+    client.scan_path(str(runbook))
+    mem = client.remember_on_page(
+        file_path=str(runbook),
+        page_number=2,
+        memory_content="Never store Docker images on OS drives",
+        quoted_sentence="OS drives are strictly protected from Docker image storage.",
+        category="config_rule",
+        memory_key="os_drive_rule",
+    )
+    assert mem.page_number == 2
+    assert mem.is_drifted is False
+
+    # Insert a new section BEFORE Storage Policy, shifting Storage Policy from Page 2 -> Page 3
+    runbook.write_text(
+        "# Page 1: Node Topology\n"
+        "workstation-01 is the primary orchestrator at 192.0.2.10.\n\n"
+        "# Page 1.5: Network Mesh\n"
+        "All nodes communicate over Tailscale WireGuard mesh.\n\n"
+        "# Page 2: Storage Policy\n"
+        "OS drives are strictly protected from Docker image storage.\n",
+        encoding="utf-8",
+    )
+
+    rep = client.scan_path(str(runbook))
+    assert rep.memories_relocated == 1
+    assert rep.memories_flagged_drifted == 0
+
+    p2_new = client.read_page(str(runbook), page_number=2)
+    p3_new = client.read_page(str(runbook), page_number=3)
+    assert len(p2_new.memories) == 0
+    assert len(p3_new.memories) == 1
+    relocated = p3_new.memories[0]
+    assert relocated.memory_key == "os_drive_rule"
+    assert relocated.page_number == 3
+    assert relocated.is_drifted is False
+    assert relocated.anchor_page_hash == p3_new.page_hash
+    assert "shift_runbook.md p.3" in relocated.citation
+
+
 def test_inode_move_and_rename_preserves_page_memories(fs_env):
     client, root = fs_env
     downloads = root / "Downloads"

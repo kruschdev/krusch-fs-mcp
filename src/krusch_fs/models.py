@@ -193,6 +193,7 @@ class SyncReport(BaseModel):
     pages_indexed: int = 0
     pages_unchanged_skipped: int = 0
     memories_auto_extracted: int = 0
+    memories_relocated: int = 0
     memories_flagged_drifted: int = 0
     repo_boundaries_handed_off: int = 0
     vault_locked_skipped: int = 0
