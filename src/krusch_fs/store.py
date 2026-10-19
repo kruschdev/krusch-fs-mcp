@@ -192,7 +192,7 @@ def create_db_session_factory(db_url: str):
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         engine = create_engine(
             db_url,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 10.0},
         )
 
         @event.listens_for(engine, "connect")
@@ -201,6 +201,7 @@ def create_db_session_factory(db_url: str):
             cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute("PRAGMA synchronous=NORMAL;")
             cursor.execute("PRAGMA foreign_keys=ON;")
+            cursor.execute("PRAGMA busy_timeout=10000;")
             cursor.close()
     else:
         engine = create_engine(db_url, pool_pre_ping=True)

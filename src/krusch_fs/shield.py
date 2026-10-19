@@ -35,6 +35,8 @@ IGNORED_DIR_NAMES = {
     ".venv",
     "venv",
     "mcp_env",
+    "site-packages",
+    "dist-packages",
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
@@ -133,6 +135,61 @@ MD_HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
 SYSTEMD_DIRECTIVE_RE = re.compile(
     r"^\s*(ExecStart|ExecStartPre|WorkingDirectory|EnvironmentFile|ListenStream|Port)\s*=\s*(.+)$"
 )
+SYSTEMD_ENV_DIRECTIVE_RE = re.compile(r"^(\s*Environment\s*=\s*)(.+)$")
+
+PRIVACY_RESTRICTIVENESS = {
+    PrivacyLevel.STANDARD: 0,
+    PrivacyLevel.METADATA_ONLY: 1,
+    PrivacyLevel.KEYS_ONLY: 2,
+    PrivacyLevel.VAULT_LOCKED: 3,
+}
+
+
+def most_restrictive_privacy_level(p1: PrivacyLevel, p2: PrivacyLevel) -> PrivacyLevel:
+    """Return the more restrictive PrivacyLevel between two classifications."""
+    return p1 if PRIVACY_RESTRICTIVENESS.get(p1, 0) >= PRIVACY_RESTRICTIVENESS.get(p2, 0) else p2
+
+
+def _has_unescaped_delim(text: str, delim: str) -> bool:
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text.startswith(delim, i):
+            return True
+        i += 1
+    return False
+
+
+def _detect_unclosed_quote_delim(raw_val: str) -> Optional[str]:
+    val = raw_val.lstrip()
+    for delim in ('"""', "'''", '"', "'"):
+        if val.startswith(delim):
+            rest = val[len(delim):]
+            if not _has_unescaped_delim(rest, delim):
+                return delim
+            return None
+    return None
+
+
+def _redact_systemd_env_line(line: str) -> str:
+    m = SYSTEMD_ENV_DIRECTIVE_RE.match(line)
+    if not m:
+        return line
+    prefix, rhs = m.group(1), m.group(2)
+    redacted_rhs = re.sub(
+        r'(["\'])([A-Za-z_][A-Za-z0-9_]*)=(?:(?!\1).)*\1',
+        r"\1\2=[REDACTED]\1",
+        rhs,
+    )
+    redacted_rhs = re.sub(
+        r'(?<![A-Za-z0-9_"\'=])([A-Za-z_][A-Za-z0-9_]*)=([^\s"\']+)',
+        lambda match: f"{match.group(1)}=[REDACTED]" if match.group(2) != "[REDACTED]" else match.group(0),
+        redacted_rhs,
+    )
+    return f"{prefix}{redacted_rhs}"
 
 
 def compute_fast_file_hash(file_path: str, size_bytes: Optional[int] = None) -> str:
@@ -180,8 +237,10 @@ def should_ignore_path(path_str: str) -> bool:
             return True
     parts = Path(norm).parts
     for part in parts:
-        if part in IGNORED_DIR_NAMES:
+        if part in IGNORED_DIR_NAMES or part.endswith(("_venv", "-venv", "_env", "-env")):
             return True
+    if os.path.isdir(norm) and os.path.isfile(os.path.join(norm, "pyvenv.cfg")):
+        return True
     return False
 
 
@@ -246,15 +305,21 @@ def redact_env_content_to_pages(file_path: str, filename: str, file_hash: str) -
 
     redacted_lines: List[str] = []
     extracted_slots: List[Dict[str, Any]] = []
-    char_cursor = 0
+    in_multiline_quote: Optional[str] = None
 
     for line_idx, line in enumerate(raw_lines, start=1):
+        if in_multiline_quote is not None:
+            redacted_lines.append("# [REDACTED_MULTILINE]")
+            if _has_unescaped_delim(line, in_multiline_quote):
+                in_multiline_quote = None
+            continue
+
         m = ENV_KEY_LINE_RE.match(line)
         if m:
             key_name = m.group(1)
+            raw_val = m.group(2)
+            in_multiline_quote = _detect_unclosed_quote_delim(raw_val)
             redacted_line = f"{key_name}=[REDACTED]"
-            start_pos = char_cursor
-            end_pos = start_pos + len(redacted_line)
             extracted_slots.append({
                 "page_number": 1,
                 "category": "config_rule",
@@ -262,20 +327,28 @@ def redact_env_content_to_pages(file_path: str, filename: str, file_hash: str) -
                 "memory_content": f"Environment variable '{key_name}' is defined in {filename} (line {line_idx}).",
                 "quoted_sentence": redacted_line,
                 "locator": f"Environment Keys > Line {line_idx}",
-                "char_start": start_pos,
-                "char_end": end_pos,
+                "char_start": 0,
+                "char_end": len(redacted_line),
             })
             redacted_lines.append(redacted_line)
-            char_cursor = end_pos + 1
         elif line.strip().startswith("#") or not line.strip():
             redacted_lines.append(line)
-            char_cursor += len(line) + 1
         else:
             redacted_line = f"# [REDACTED_LINE_{line_idx}]"
             redacted_lines.append(redacted_line)
-            char_cursor += len(redacted_line) + 1
 
     full_text = "\n".join(redacted_lines).strip() or f"# Empty env file: {filename}"
+    search_from = 0
+    for slot in extracted_slots:
+        q = slot["quoted_sentence"]
+        pos = full_text.find(q, search_from)
+        if pos < 0:
+            pos = full_text.find(q)
+        if pos >= 0:
+            slot["char_start"] = pos
+            slot["char_end"] = pos + len(q)
+            search_from = pos + len(q)
+
     locator = "Environment Keys (Values Redacted)"
     struct_loc = StructuredLocator.from_raw(
         page=1,
@@ -324,7 +397,11 @@ def _segment_unpaged_text_into_pages(
     1-based logical pages so every memory on the OS is tied to a specific page_number.
     Also extracts deterministic config/systemd slots where present.
     """
-    lines = (text or "").splitlines()
+    raw_lines = (text or "").splitlines()
+    if filename.lower().endswith((".service", ".timer", ".socket", ".mount")) or "[Service]" in (text or ""):
+        lines = [_redact_systemd_env_line(ln) for ln in raw_lines]
+    else:
+        lines = raw_lines
     if not lines:
         empty_text = f"[Empty file: {filename}]"
         loc = StructuredLocator.from_raw(page=1, pdf_page=1, header="Page 1", locator_str="Page 1")
@@ -606,13 +683,21 @@ def parse_remote_text_with_nexus(
         )
 
     if privacy_level == PrivacyLevel.KEYS_ONLY:
-        # Extract key slots from already-redacted KEY=[REDACTED] lines
+        # Extract key slots from already-redacted KEY=[REDACTED] lines (and redact if unredacted)
         slots: List[Dict[str, Any]] = []
-        char_cursor = 0
+        redacted_lines: List[str] = []
+        in_multiline_quote: Optional[str] = None
         for line_idx, line in enumerate(text_content.splitlines(), start=1):
+            if in_multiline_quote is not None:
+                redacted_lines.append("# [REDACTED_MULTILINE]")
+                if _has_unescaped_delim(line, in_multiline_quote):
+                    in_multiline_quote = None
+                continue
             m = ENV_KEY_LINE_RE.match(line)
             if m:
                 key_name = m.group(1)
+                raw_val = m.group(2)
+                in_multiline_quote = _detect_unclosed_quote_delim(raw_val)
                 redacted_line = f"{key_name}=[REDACTED]"
                 slots.append({
                     "page_number": 1,
@@ -621,13 +706,28 @@ def parse_remote_text_with_nexus(
                     "memory_content": f"Environment variable '{key_name}' is defined in {filename} (line {line_idx}).",
                     "quoted_sentence": redacted_line,
                     "locator": f"Environment Keys > Line {line_idx}",
-                    "char_start": char_cursor,
-                    "char_end": char_cursor + len(redacted_line),
+                    "char_start": 0,
+                    "char_end": len(redacted_line),
                 })
-            char_cursor += len(line) + 1
+                redacted_lines.append(redacted_line)
+            elif line.strip().startswith("#") or not line.strip():
+                redacted_lines.append(line)
+            else:
+                redacted_lines.append(f"# [REDACTED_LINE_{line_idx}]")
+        full_text = "\n".join(redacted_lines).strip() or f"# Empty env file: {filename}"
+        search_from = 0
+        for slot in slots:
+            q = slot["quoted_sentence"]
+            pos = full_text.find(q, search_from)
+            if pos < 0:
+                pos = full_text.find(q)
+            if pos >= 0:
+                slot["char_start"] = pos
+                slot["char_end"] = pos + len(q)
+                search_from = pos + len(q)
         loc = "Environment Keys (Values Redacted)"
         struct_loc = StructuredLocator.from_raw(
-            page=1, pdf_page=1, locator_str=loc, header=loc, char_span=(0, len(text_content))
+            page=1, pdf_page=1, locator_str=loc, header=loc, char_span=(0, len(full_text))
         )
         page = PageData(
             index=1,
@@ -635,10 +735,10 @@ def parse_remote_text_with_nexus(
             printed_page="1",
             locator=loc,
             structured_locator=struct_loc,
-            text=text_content,
-            digital_text=text_content,
-            blocks=[ContentBlock(text=text_content, block_type="paragraph", char_start=0, char_end=len(text_content))],
-            char_count=len(text_content),
+            text=full_text,
+            digital_text=full_text,
+            blocks=[ContentBlock(text=full_text, block_type="paragraph", char_start=0, char_end=len(full_text))],
+            char_count=len(full_text),
         )
         return (
             ParserResult(

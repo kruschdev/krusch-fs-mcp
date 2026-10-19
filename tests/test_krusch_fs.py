@@ -552,4 +552,339 @@ def test_multi_node_fleet_indexing_and_host_filtering(fs_env, monkeypatch):
     assert st["files_by_host_node"]["storage-node-01"] == 1
 
 
+def test_fs01_symlink_rejection_and_realpath_privacy_classification(fs_env):
+    client, root = fs_env
+    real_doc = root / "real_doc.md"
+    real_doc.write_text("# Real Doc\nLegitimate content.\n", encoding="utf-8")
+
+    # 1. File symlink must be rejected by index_file()
+    symlink_doc = root / "symlink_doc.md"
+    os.symlink(real_doc, symlink_doc)
+    assert client.index_file(str(symlink_doc)) is None
+
+    # 2. File inside a symlinked directory pointing to an ignored path (node_modules) must be rejected
+    ignored_dir = root / "node_modules" / "pkg"
+    ignored_dir.mkdir(parents=True)
+    ignored_file = ignored_dir / "readme.md"
+    ignored_file.write_text("# Package\nShould be ignored.\n", encoding="utf-8")
+
+    linked_dir = root / "innocent_dir"
+    os.symlink(ignored_dir, linked_dir)
+    assert client.index_file(str(linked_dir / "readme.md")) is None
+
+    # 3. File inside a symlinked directory pointing into /.ssh/ must get VAULT_LOCKED via real_path
+    ssh_dir = root / ".ssh"
+    ssh_dir.mkdir(exist_ok=True)
+    custom_secret_file = ssh_dir / "custom_identity_token"
+    custom_secret_file.write_text("SECRET_SSH_IDENTITY_MATERIAL_XYZ", encoding="utf-8")
+
+    alias_ssh_dir = root / "public_looking_dir"
+    os.symlink(ssh_dir, alias_ssh_dir)
+    indexed_secret = client.index_file(str(alias_ssh_dir / "custom_identity_token"))
+    assert indexed_secret is not None
+    assert indexed_secret.privacy_level == PrivacyLevel.VAULT_LOCKED.value
+    p1 = client.read_page(str(alias_ssh_dir / "custom_identity_token"), page_number=1)
+    assert "SECRET_SSH_IDENTITY_MATERIAL_XYZ" not in p1.text
+
+
+def test_fs02_multiline_env_redaction_and_systemd_inline_env_redaction(fs_env):
+    from krusch_fs.shield import redact_env_content_to_pages, _segment_unpaged_text_into_pages
+
+    client, root = fs_env
+    env_file = root / ".env"
+    env_file.write_text(
+        "\n\n# Header comment\n"
+        'MULTI_DOUBLE="first line of secret\n'
+        "FAKE_KEY_IN_DOUBLE=leaked_value_123\n"
+        "# fake comment inside multiline secret\n"
+        'end of double secret"\n'
+        "MULTI_TRIPLE=\"\"\"-----BEGIN PRIVATE KEY-----\n"
+        "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC=\n"
+        "FAKE_TRIPLE_KEY=leaked_triple_456\n"
+        "-----END PRIVATE KEY-----\"\"\"\n"
+        "MULTI_SINGLE='line one\n"
+        "FAKE_SINGLE_KEY=leaked_single_789\n"
+        "line two'\n"
+        "REAL_AFTER_KEY=real_secret_value\n",
+        encoding="utf-8",
+    )
+
+    res, slots = redact_env_content_to_pages(str(env_file), ".env", "hash123")
+    page_text = res.pages[0].text
+    assert "leaked_value_123" not in page_text
+    assert "leaked_triple_456" not in page_text
+    assert "leaked_single_789" not in page_text
+    assert "real_secret_value" not in page_text
+    assert "FAKE_KEY_IN_DOUBLE" not in page_text
+    assert "FAKE_TRIPLE_KEY" not in page_text
+    assert "FAKE_SINGLE_KEY" not in page_text
+    assert "# fake comment inside multiline secret" not in page_text
+    assert "# [REDACTED_MULTILINE]" in page_text
+
+    slot_keys = [s["memory_key"] for s in slots]
+    assert slot_keys == ["MULTI_DOUBLE", "MULTI_TRIPLE", "MULTI_SINGLE", "REAL_AFTER_KEY"]
+
+    # Verify FS-06: every slot's char_start:char_end slices exact quoted_sentence in final full_text
+    for s in slots:
+        assert page_text[s["char_start"]:s["char_end"]] == s["quoted_sentence"]
+
+    # Verify systemd .service inline Environment="KEY=SECRET" redaction
+    svc_text = (
+        "[Unit]\n"
+        "Description=API Worker\n\n"
+        "[Service]\n"
+        'Environment="OPENAI_API_KEY=sk-live-999999" "DB_PASSWORD=topsecret"\n'
+        "Environment=RAW_TOKEN=tok_abc123\n"
+        "ExecStart=/usr/bin/python3 app.py\n"
+    )
+    pages, _ = _segment_unpaged_text_into_pages(svc_text, "api-worker.service")
+    combined_svc_text = "\n".join(p.text for p in pages)
+    assert "sk-live-999999" not in combined_svc_text
+    assert "topsecret" not in combined_svc_text
+    assert "tok_abc123" not in combined_svc_text
+    assert 'Environment="OPENAI_API_KEY=[REDACTED]" "DB_PASSWORD=[REDACTED]"' in combined_svc_text
+    assert "Environment=RAW_TOKEN=[REDACTED]" in combined_svc_text
+
+
+def test_fs03_remote_scanner_json_payload_expanduser_and_ssh_guard(fs_env, monkeypatch):
+    import subprocess
+    import sys
+    from krusch_fs.fleet import REMOTE_SCANNER_SCRIPT_TEMPLATE, probe_node_ssh, stream_remote_node_entries
+
+    client, root = fs_env
+    env_p = root / ".env.remote"
+    env_p.write_text(
+        'SECRET_KEY="line1\nFAKE_INNER=secret_inner\nline2"\nNORMAL_KEY=val\n',
+        encoding="utf-8",
+    )
+
+    # 1. Payload with None/True/False must parse via json.loads(__PAYLOAD_JSON_STR__) without NameError
+    payload_obj = {
+        "roots": [str(env_p)],
+        "known_hashes": {"/nonexistent": None},
+        "max_depth": 2,
+        "max_files": 10,
+        "flag_true": True,
+        "flag_false": False,
+    }
+    script_code = REMOTE_SCANNER_SCRIPT_TEMPLATE.replace(
+        "__PAYLOAD_JSON_STR__", json.dumps(json.dumps(payload_obj))
+    )
+    proc = subprocess.run([sys.executable, "-c", script_code], capture_output=True, text=True, check=True)
+    lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip().startswith("{")]
+    assert len(lines) == 1
+    assert "FAKE_INNER" not in lines[0]["text_content"]
+    assert "# [REDACTED_MULTILINE]" in lines[0]["text_content"]
+
+    # 2. Reject ssh_target starting with "-"
+    with pytest.raises(ValueError, match="Invalid ssh_target"):
+        stream_remote_node_entries("-oProxyCommand=evil", ["/etc"], {})
+
+    assert probe_node_ssh("bad-node", fleet_map={"bad-node": {"local": False, "ssh_targets": ["-oProxyCommand=evil"]}}) is None
+
+    # 3. Verify "--" is passed before ssh_target and ~ is not expanded locally in scan_remote_node
+    captured_cmds = []
+    captured_inputs = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_cmds.append(cmd)
+        if "input" in kwargs:
+            captured_inputs.append(kwargs["input"])
+
+        class DummyRes:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return DummyRes()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = probe_node_ssh("remote-1", fleet_map={"remote-1": {"local": False, "ssh_targets": ["10.0.0.99"]}})
+    assert target == "10.0.0.99"
+    assert "--" in captured_cmds[-1]
+    dash_idx = captured_cmds[-1].index("--")
+    assert captured_cmds[-1][dash_idx + 1] == "10.0.0.99"
+
+    client.scan_remote_node("remote-1", roots=["~/remote_docs"], ssh_target_override="10.0.0.99")
+    assert len(captured_inputs) == 1
+    # Verify ~/remote_docs was sent unexpanded in the payload so the remote host expands ~
+    assert "~/remote_docs" in captured_inputs[0]
+
+
+def test_fs04_deleted_files_marked_deleted_and_filtered(fs_env):
+    from krusch_fs.store import FSChunk
+
+    client, root = fs_env
+    scan_dir = root / "watched_docs"
+    scan_dir.mkdir()
+    f1 = scan_dir / "keep.md"
+    f2 = scan_dir / "remove_me.md"
+    f1.write_text("# Keep\nThis file stays on disk.\n", encoding="utf-8")
+    f2.write_text("# Remove\nThis file will be deleted soon.\n", encoding="utf-8")
+
+    client.scan_path(str(scan_dir))
+    mem = client.remember_on_page(
+        file_path=str(f2),
+        page_number=1,
+        memory_content="Temporary note on remove_me.md",
+        quoted_sentence="This file will be deleted soon.",
+    )
+    assert not mem.is_drifted
+    assert client.status()["total_files"] == 2
+
+    # Delete f2 from disk and re-scan directory
+    f2.unlink()
+    rep = client.scan_path(str(scan_dir))
+    assert rep.memories_flagged_drifted == 1
+
+    st = client.status()
+    assert st["total_files"] == 1
+    assert st["total_pages"] == 1
+    assert st["drifted_page_memories"] == 1
+
+    # Chunks for deleted file must be removed
+    db = client.SessionLocal()
+    try:
+        assert db.query(FSChunk).filter(FSChunk.file_id == mem.file_id).count() == 0
+    finally:
+        db.close()
+
+    # get_page_tree and read_page must filter is_deleted == False and raise FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        client.get_page_tree(str(f2))
+    with pytest.raises(FileNotFoundError):
+        client.read_page(str(f2), page_number=1)
+
+
+def test_fs05_fs06_fs07_drift_status_clamping_exact_hash_relocation_and_pointer_slice(fs_env):
+    from krusch_fs.store import FSChunk, PageMemory
+
+    client, root = fs_env
+    doc = root / "evolving_spec.md"
+    doc.write_text(
+        "# Page 1: Intro\n"
+        "Shared sentence across pages.\n\n"
+        "# Page 2: Target Section\n"
+        "Shared sentence across pages.\n"
+        "Unique target anchor text on page 2.\n\n"
+        "# Page 3: Epilogue\n"
+        "Epilogue text that will be removed when file shrinks.\n",
+        encoding="utf-8",
+    )
+    client.scan_path(str(doc))
+
+    # FS-06: Verify pointer-slice chunk deduplication stored content=""
+    db = client.SessionLocal()
+    try:
+        chunks = db.query(FSChunk).all()
+        assert len(chunks) >= 3
+        assert all(c.content == "" for c in chunks)
+    finally:
+        db.close()
+
+    # Pin memory on Page 2 using the shared sentence and a memory on Page 3
+    m_shared = client.remember_on_page(
+        file_path=str(doc),
+        page_number=2,
+        memory_content="Anchored to Page 2 target section.",
+        quoted_sentence="Shared sentence across pages.",
+    )
+    m_epilogue = client.remember_on_page(
+        file_path=str(doc),
+        page_number=3,
+        memory_content="Epilogue note.",
+        quoted_sentence="Epilogue text that will be removed when file shrinks.",
+    )
+    assert m_shared.drift_status == "VALID"
+    assert m_epilogue.drift_status == "VALID"
+
+    # FS-07: Check _memory_to_item with current_page_hash="" preserves ""
+    db = client.SessionLocal()
+    try:
+        raw_mem = db.query(PageMemory).filter(PageMemory.id == m_shared.id).first()
+        item_empty_hash = client._memory_to_item(raw_mem, str(doc), current_page_hash="")
+        assert item_empty_hash.current_page_hash == ""
+    finally:
+        db.close()
+
+    # Insert a new Page 2 that ALSO contains "Shared sentence across pages." (modified page),
+    # while shifting the original Page 2 (with exact anchor_page_hash!) to Page 3, and dropping old Page 3.
+    doc.write_text(
+        "# Page 1: Intro\n"
+        "Shared sentence across pages.\n\n"
+        "# Page 2: Newly Inserted Section\n"
+        "Shared sentence across pages.\n"
+        "Modified content on new page 2.\n\n"
+        "# Page 2: Target Section\n"
+        "Shared sentence across pages.\n"
+        "Unique target anchor text on page 2.\n",
+        encoding="utf-8",
+    )
+    client.scan_path(str(doc))
+
+    # Because Page 3 has the exact anchor_page_hash of old Page 2, m_shared must relocate to Page 3!
+    p3 = client.read_page(str(doc), page_number=3)
+    assert any(m.id == m_shared.id and not m.is_drifted and m.drift_status == "VALID" for m in p3.memories)
+
+    # Now shrink the file to 1 page so m_epilogue (and m_shared) are beyond total_pages=1 and un-relocated
+    doc.write_text("# Page 1: Minimal\nCompletely rewritten single page.\n", encoding="utf-8")
+    client.scan_path(str(doc))
+
+    tree = client.get_page_tree(str(doc))
+    assert tree.total_pages == 1
+    assert len(tree.pages[0].memories) == 2
+    assert all(m.is_drifted and m.drift_status == "STALE_DRIFT" and m.page_number == 1 for m in tree.pages[0].memories)
+
+    p1 = client.read_page(str(doc), page_number=1)
+    assert len(p1.memories) == 2
+    assert all(m.drift_status == "STALE_DRIFT" for m in p1.memories)
+
+
+def test_fs08_fs09_fs10_busy_timeout_idempotent_remember_and_mcp_sync(fs_env):
+    from sqlalchemy import text
+
+    client, root = fs_env
+    # FS-08: Verify PRAGMA busy_timeout=10000
+    with client.engine.connect() as conn:
+        timeout_val = conn.execute(text("PRAGMA busy_timeout;")).scalar()
+        assert int(timeout_val) == 10000
+
+    doc = root / "idempotent.md"
+    doc.write_text("# Policy\nAll backups must be encrypted with age.\n", encoding="utf-8")
+
+    # FS-10: krusch_fs_sync with singular path, default action="status", and node="all"
+    sync_out = json.loads(krusch_fs_sync(path=str(doc), node="all"))
+    assert sync_out["status"] == "success"
+    assert sync_out["sync_report"]["host_node"] == "krusch-test"
+    assert sync_out["sync_report"]["files_indexed"] == 1
+
+    # Re-running with force=True must re-index the file instead of skipping as unchanged
+    forced_out = json.loads(krusch_fs_sync(path=str(doc), node="all", force=True))
+    assert forced_out["status"] == "success"
+    assert forced_out["sync_report"]["files_indexed"] == 1
+    assert forced_out["sync_report"]["files_unchanged"] == 0
+    assert "all" not in client.status()["files_by_host_node"]
+
+    # FS-09: Repeated identical remember_on_page calls must be idempotent
+    m1 = client.remember_on_page(
+        file_path=str(doc),
+        page_number=1,
+        memory_content="Backups use age encryption",
+        quoted_sentence="All backups must be encrypted with age.",
+        category="config_rule",
+        memory_key="backup_encryption",
+    )
+    m2 = client.remember_on_page(
+        file_path=str(doc),
+        page_number=1,
+        memory_content="Backups use age encryption",
+        quoted_sentence="All backups must be encrypted with age.",
+        category="config_rule",
+        memory_key="backup_encryption",
+    )
+    assert m1.id == m2.id
+    p1 = client.read_page(str(doc), page_number=1)
+    assert len(p1.memories) == 1
+
+
 

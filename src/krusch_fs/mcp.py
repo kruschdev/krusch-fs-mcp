@@ -85,8 +85,10 @@ def krusch_fs_search(
     path_prefix: Optional[str] = None,
     category: Optional[str] = None,
     host_node: Optional[str] = None,
+    node: Optional[str] = None,
     include_memories: bool = True,
     limit: int = 5,
+    top_k: Optional[int] = None,
 ) -> str:
     """Search OS files and page-bound memories across the fleet with Dual-Clock temporal decay."""
     try:
@@ -95,9 +97,9 @@ def krusch_fs_search(
             workspace=workspace,
             path_prefix=path_prefix,
             category=category,
-            host_node=host_node,
+            host_node=host_node or node,
             include_memories=include_memories,
-            limit=limit,
+            limit=top_k if top_k is not None else limit,
         )
         return json.dumps(
             {
@@ -119,10 +121,18 @@ def krusch_fs_search(
     ),
     annotations=READ_ONLY_ANNOTATIONS,
 )
-def krusch_fs_page_tree(file_path: str, host_node: Optional[str] = None) -> str:
+def krusch_fs_page_tree(
+    file_path: Optional[str] = None,
+    host_node: Optional[str] = None,
+    path: Optional[str] = None,
+    node: Optional[str] = None,
+) -> str:
     """Inspect the page hierarchy and page-bound memory map of a file."""
     try:
-        tree = get_client().get_page_tree(file_path=file_path, host_node=host_node)
+        target_path = file_path or path
+        if not target_path:
+            return json.dumps({"status": "error", "error": "file_path (or path) is required."})
+        tree = get_client().get_page_tree(file_path=target_path, host_node=host_node or node)
         return json.dumps(
             {
                 "status": "success",
@@ -144,18 +154,23 @@ def krusch_fs_page_tree(file_path: str, host_node: Optional[str] = None) -> str:
     annotations=READ_ONLY_ANNOTATIONS,
 )
 def krusch_fs_read_page(
-    file_path: str,
+    file_path: Optional[str] = None,
     page_number: int = 1,
     end_page: Optional[int] = None,
     host_node: Optional[str] = None,
+    path: Optional[str] = None,
+    node: Optional[str] = None,
 ) -> str:
     """Read a specific page and its attached memories."""
     try:
+        target_path = file_path or path
+        if not target_path:
+            return json.dumps({"status": "error", "error": "file_path (or path) is required."})
         res = get_client().read_page(
-            file_path=file_path,
+            file_path=target_path,
             page_number=page_number,
             end_page=end_page,
-            host_node=host_node,
+            host_node=host_node or node,
         )
         if isinstance(res, list):
             payload = {"status": "success", "pages": [p.model_dump() for p in res]}
@@ -176,24 +191,42 @@ def krusch_fs_read_page(
     annotations=WRITE_IDEMPOTENT_ANNOTATIONS,
 )
 def krusch_fs_remember_on_page(
-    file_path: str,
-    page_number: int,
-    memory_content: str,
-    quoted_sentence: str,
+    file_path: Optional[str] = None,
+    page_number: int = 1,
+    memory_content: Optional[str] = None,
+    quoted_sentence: Optional[str] = None,
     category: str = "fact",
     memory_key: Optional[str] = None,
     host_node: Optional[str] = None,
+    path: Optional[str] = None,
+    note: Optional[str] = None,
+    node: Optional[str] = None,
 ) -> str:
     """Anchor a verified memory directly to a specific page of a file."""
     try:
+        target_path = file_path or path
+        target_content = memory_content or note
+        target_node = host_node or node
+        if not target_path or not target_content:
+            return json.dumps({"status": "error", "error": "file_path (or path) and memory_content (or note) are required."})
+        target_quote = quoted_sentence
+        if not target_quote:
+            page_view = get_client().read_page(
+                file_path=target_path,
+                page_number=page_number,
+                host_node=target_node,
+            )
+            p_text = getattr(page_view, "text", "") or ""
+            non_empty = [ln.strip() for ln in p_text.splitlines() if ln.strip()]
+            target_quote = non_empty[0] if non_empty else target_content
         item = get_client().remember_on_page(
-            file_path=file_path,
+            file_path=target_path,
             page_number=page_number,
-            memory_content=memory_content,
-            quoted_sentence=quoted_sentence,
+            memory_content=target_content,
+            quoted_sentence=target_quote,
             category=category,
             memory_key=memory_key,
-            host_node=host_node,
+            host_node=target_node,
         )
         return json.dumps(
             {
@@ -219,9 +252,12 @@ def krusch_fs_locate(
     workspace: Optional[str] = None,
     extension: Optional[str] = None,
     min_size_mb: Optional[float] = None,
+    min_size_bytes: Optional[int] = None,
     modified_within_hours: Optional[float] = None,
     find_duplicates: bool = False,
     host_node: Optional[str] = None,
+    node: Optional[str] = None,
+    category: Optional[str] = None,
     limit: int = 25,
 ) -> str:
     """Locate files across the OS fleet by metadata predicates or duplicate hash."""
@@ -231,9 +267,11 @@ def krusch_fs_locate(
             workspace=workspace,
             extension=extension,
             min_size_mb=min_size_mb,
+            min_size_bytes=min_size_bytes,
             modified_within_hours=modified_within_hours,
             find_duplicates=find_duplicates,
-            host_node=host_node,
+            host_node=host_node or node,
+            category=category,
             limit=limit,
         )
         return json.dumps(
@@ -260,30 +298,53 @@ def krusch_fs_locate(
 def krusch_fs_sync(
     action: str = "status",
     path: Optional[str] = None,
+    paths: Optional[List[str]] = None,
     workspace: Optional[str] = None,
     host_node: Optional[str] = None,
+    node: Optional[str] = None,
+    force: bool = False,
 ) -> str:
     """Run an incremental directory/file scan, fleet-wide sync, or inspect index status."""
     try:
+        raw_node = (host_node or node or "").strip()
+        target_node = None if raw_node.lower() in ("", "all") else raw_node
         act = (action or "status").strip().lower()
+        scan_targets: List[str] = []
+        if paths:
+            if isinstance(paths, str):
+                scan_targets = [paths]
+            else:
+                scan_targets = [p for p in paths if p]
+        elif path:
+            scan_targets = [path]
+
+        if scan_targets and act == "status":
+            act = "scan"
         if act == "status":
             return json.dumps({"status": "success", "index": get_client().status()}, indent=2)
         if act == "sync_fleet":
             nodes_list: Optional[List[str]] = None
-            if host_node and host_node != "all":
-                nodes_list = [n.strip() for n in host_node.split(",") if n.strip()]
-            rep = get_client().sync_fleet(nodes=nodes_list)
+            if target_node:
+                nodes_list = [n.strip() for n in target_node.split(",") if n.strip() and n.strip().lower() != "all"]
+            rep = get_client().sync_fleet(nodes=nodes_list, force=force)
             return json.dumps({"status": "success", "fleet_sync_report": rep.model_dump()}, indent=2)
         if act in ("scan", "add_root"):
-            if not path:
-                return json.dumps({"status": "error", "error": "path is required when action='scan' or 'add_root'."})
-            rep = get_client().scan_path(
-                target_path=path,
-                workspace=workspace,
-                register_watch_root=True,
-                host_node=host_node,
+            if not scan_targets:
+                return json.dumps({"status": "error", "error": "path (or paths) is required when action='scan' or 'add_root'."})
+            reports = []
+            for p in scan_targets:
+                rep = get_client().scan_path(
+                    target_path=p,
+                    workspace=workspace,
+                    register_watch_root=True,
+                    host_node=target_node,
+                    force=force,
+                )
+                reports.append(rep.model_dump())
+            return json.dumps(
+                {"status": "success", "sync_report": reports[0] if len(reports) == 1 else reports},
+                indent=2,
             )
-            return json.dumps({"status": "success", "sync_report": rep.model_dump()}, indent=2)
         return json.dumps(
             {
                 "status": "error",

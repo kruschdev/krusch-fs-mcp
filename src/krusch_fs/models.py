@@ -84,6 +84,7 @@ class PageMemoryItem(BaseModel):
     anchor_page_hash: str
     current_page_hash: Optional[str] = None
     is_drifted: bool = False
+    drift_status: str = "VALID"
     created_at: Optional[str] = None
 
 

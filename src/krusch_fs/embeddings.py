@@ -55,7 +55,7 @@ def embed_text(
         try:
             req = urllib.request.Request(
                 f"{ollama_url.rstrip('/')}/api/embeddings",
-                data=json.dumps({"model": model, "prompt": text[:4000]}).encode("utf-8"),
+                data=json.dumps({"model": model, "prompt": text[:4000], "keep_alive": -1}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )

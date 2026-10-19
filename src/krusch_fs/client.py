@@ -49,6 +49,7 @@ from .shield import (
     is_git_repo_root,
     classify_workspace_zone,
     classify_privacy_level,
+    most_restrictive_privacy_level,
     parse_os_file_with_nexus,
     parse_remote_text_with_nexus,
 )
@@ -68,6 +69,11 @@ class KruschFSClient:
     @classmethod
     def from_env(cls) -> "KruschFSClient":
         return cls(KruschFSConfig())
+
+    def _resolve_node(self, host_node: Optional[str]) -> str:
+        if not host_node or not host_node.strip() or host_node.strip().lower() == "all":
+            return self.config.host_node
+        return host_node.strip()
 
     def _embed(self, text: str) -> List[float]:
         return embed_text(
@@ -91,6 +97,7 @@ class KruschFSClient:
                 bbox_val = json.loads(mem.bbox) if isinstance(mem.bbox, str) else list(mem.bbox)
             except Exception:
                 bbox_val = None
+        is_drifted_bool = bool(mem.is_drifted)
         return PageMemoryItem(
             id=mem.id,
             host_node=host_node,
@@ -109,8 +116,9 @@ class KruschFSClient:
             char_start=mem.char_start,
             char_end=mem.char_end,
             anchor_page_hash=mem.anchor_page_hash,
-            current_page_hash=current_page_hash or mem.anchor_page_hash,
-            is_drifted=bool(mem.is_drifted),
+            current_page_hash=current_page_hash if current_page_hash is not None else mem.anchor_page_hash,
+            is_drifted=is_drifted_bool,
+            drift_status="STALE_DRIFT" if is_drifted_bool else "VALID",
             created_at=mem.created_at.isoformat() if mem.created_at else None,
         )
 
@@ -148,11 +156,13 @@ class KruschFSClient:
         auto_slots: List[Dict[str, Any]],
         existing_by_path: Optional[FSFile],
         _report: Optional[SyncReport] = None,
+        force: bool = False,
     ) -> FSFile:
         file_name = os.path.basename(abs_path)
         parent_path = os.path.dirname(abs_path)
         ext = os.path.splitext(file_name)[1].lower()
         total_pages = max(1, len(parsed_res.pages))
+        was_deleted = bool(existing_by_path and existing_by_path.is_deleted)
 
         if existing_by_path is None:
             fs_file = FSFile(
@@ -223,7 +233,7 @@ class KruschFSClient:
             blocks_payload = json.dumps([b.model_dump() for b in (page_data.blocks or [])])
 
             old_page = existing_pages.get(p_num)
-            if old_page and old_page.page_hash == p_hash:
+            if old_page and old_page.page_hash == p_hash and not force and not was_deleted:
                 live_pages_by_num[p_num] = old_page
                 if _report is not None:
                     _report.pages_unchanged_skipped += 1
@@ -292,14 +302,28 @@ class KruschFSClient:
                     )
                     c_start = nc.char_start
                     c_end = nc.char_end
-                    if (c_start is None or c_end is None) and nc.text and nc.text in page_full_text:
-                        c_start = page_full_text.find(nc.text)
-                        c_end = c_start + len(nc.text)
-                    can_slice = (
+                    nc_text = nc.text or ""
+                    if (c_start is None or c_end is None) and nc_text:
+                        if nc_text in page_full_text:
+                            c_start = page_full_text.find(nc_text)
+                            c_end = c_start + len(nc_text)
+                        else:
+                            norm_pat = re.sub(r"\s+", r"\\s+", re.escape(nc_text.strip()))
+                            m_slice = re.search(norm_pat, page_full_text)
+                            if m_slice:
+                                c_start = m_slice.start()
+                                c_end = m_slice.end()
+                    can_slice = False
+                    if (
                         c_start is not None
                         and c_end is not None
-                        and page_full_text[c_start:c_end] == nc.text
-                    )
+                        and 0 <= c_start < c_end <= len(page_full_text)
+                    ):
+                        sliced = page_full_text[c_start:c_end]
+                        can_slice = (
+                            sliced == nc_text
+                            or " ".join(sliced.split()) == " ".join(nc_text.split())
+                        )
                     db.add(
                         FSChunk(
                             file_id=fs_file.id,
@@ -311,12 +335,12 @@ class KruschFSClient:
                             citation=c_cit,
                             header=nc.header or sec_hdr,
                             locator=nc.locator or page_data.locator,
-                            content="" if can_slice else nc.text,
+                            content="" if can_slice else nc_text,
                             source_hash=nc.source_hash,
                             char_start=c_start,
                             char_end=c_end,
                             bbox=json.dumps(nc.bbox) if nc.bbox else None,
-                            embedding=self._embed(f"{sec_hdr or ''} {nc.text}"),
+                            embedding=self._embed(f"{sec_hdr or ''} {nc_text}"),
                         )
                     )
             if _report is not None:
@@ -362,9 +386,10 @@ class KruschFSClient:
         db.flush()
 
         # Reconcile pinned PageMemory anchors:
-        # 1) Same-page re-anchoring (if quote still exists on mem.page_number)
-        # 2) Cross-page relocation ("same text, new page" when insertions/deletions shift pages)
-        # 3) True content drift (STALE_DRIFT only when quoted_sentence no longer exists on any page)
+        # 1) Same-page exact hash or cross-page exact page_hash relocation (prioritizes unmodified shifted page)
+        # 2) Same-page substring re-anchoring (if page modified in place and quote still exists)
+        # 3) Cross-page substring relocation (if shifted page was also modified)
+        # 4) True content drift (clamp onto total_pages if file shrank, keeping is_drifted = True)
         if changed_or_removed_pages:
             pinned_memories = (
                 db.query(PageMemory)
@@ -375,10 +400,61 @@ class KruschFSClient:
                 .all()
             )
             for mem in pinned_memories:
-                if mem.page_number not in changed_or_removed_pages and not mem.is_drifted:
+                if mem.page_number not in changed_or_removed_pages and not mem.is_drifted and mem.page_number <= total_pages:
                     continue
 
                 curr_page = live_pages_by_num.get(mem.page_number)
+                # 1a. Same page has exact matching anchor_page_hash
+                if (
+                    curr_page is not None
+                    and curr_page.page_hash == mem.anchor_page_hash
+                    and mem.quoted_sentence
+                    and mem.quoted_sentence in (curr_page.page_text or "")
+                ):
+                    pos = curr_page.page_text.find(mem.quoted_sentence)
+                    mem.page_id = curr_page.id
+                    mem.printed_page = curr_page.printed_page
+                    mem.citation = curr_page.citation
+                    mem.locator = curr_page.locator
+                    mem.anchor_page_hash = curr_page.page_hash
+                    mem.char_start = pos
+                    mem.char_end = pos + len(mem.quoted_sentence)
+                    mem.is_drifted = False
+                    continue
+
+                # 1b. Another page has exact matching anchor_page_hash (pure page shift)
+                relocated = False
+                if mem.anchor_page_hash:
+                    exact_hash_pages = sorted(
+                        (
+                            p
+                            for p_num, p in live_pages_by_num.items()
+                            if p_num != mem.page_number and p.page_hash == mem.anchor_page_hash
+                        ),
+                        key=lambda p: (abs(p.page_number - mem.page_number), p.page_number),
+                    )
+                    for cand_page in exact_hash_pages:
+                        cand_text = cand_page.page_text or ""
+                        if not mem.quoted_sentence or mem.quoted_sentence in cand_text:
+                            pos = cand_text.find(mem.quoted_sentence) if mem.quoted_sentence else 0
+                            mem.page_id = cand_page.id
+                            mem.page_number = cand_page.page_number
+                            mem.printed_page = cand_page.printed_page
+                            mem.citation = cand_page.citation
+                            mem.locator = cand_page.locator
+                            mem.anchor_page_hash = cand_page.page_hash
+                            if mem.quoted_sentence and pos >= 0:
+                                mem.char_start = pos
+                                mem.char_end = pos + len(mem.quoted_sentence)
+                            mem.is_drifted = False
+                            if _report is not None:
+                                _report.memories_relocated += 1
+                            relocated = True
+                            break
+                if relocated:
+                    continue
+
+                # 2. Same-page substring re-anchoring on modified page
                 if curr_page is not None and mem.quoted_sentence and mem.quoted_sentence in (curr_page.page_text or ""):
                     pos = curr_page.page_text.find(mem.quoted_sentence)
                     mem.page_id = curr_page.id
@@ -391,7 +467,7 @@ class KruschFSClient:
                     mem.is_drifted = False
                     continue
 
-                relocated = False
+                # 3. Cross-page substring relocation
                 if mem.quoted_sentence:
                     candidate_pages = sorted(
                         (p for p_num, p in live_pages_by_num.items() if p_num != mem.page_number),
@@ -415,9 +491,12 @@ class KruschFSClient:
                             relocated = True
                             break
 
+                # 4. Un-relocated drift: clamp onto total_pages if file shrank
                 if not relocated:
-                    if curr_page is None:
-                        mem.page_id = None
+                    if mem.page_number > total_pages:
+                        mem.page_number = total_pages
+                    clamped_page = live_pages_by_num.get(mem.page_number)
+                    mem.page_id = clamped_page.id if clamped_page is not None else None
                     mem.is_drifted = True
                     if _report is not None:
                         _report.memories_flagged_drifted += 1
@@ -435,11 +514,18 @@ class KruschFSClient:
         handoff_repo: Optional[str] = None,
         host_node: Optional[str] = None,
         _report: Optional[SyncReport] = None,
+        force: bool = False,
     ) -> Optional[FSFile]:
         """Index or incrementally update a local OS file in-place."""
-        node_name = host_node or self.config.host_node
-        abs_path = os.path.abspath(os.path.expanduser(file_path))
-        if not os.path.isfile(abs_path):
+        node_name = self._resolve_node(host_node)
+        raw_expanded = os.path.expanduser(file_path)
+        if os.path.islink(raw_expanded):
+            return None
+        abs_path = os.path.abspath(raw_expanded)
+        if os.path.islink(abs_path) or not os.path.isfile(abs_path):
+            return None
+        real_path = os.path.realpath(abs_path)
+        if should_ignore_path(abs_path) or should_ignore_path(real_path):
             return None
 
         st = os.stat(abs_path)
@@ -457,7 +543,10 @@ class KruschFSClient:
             if handoff_repo
             else classify_workspace_zone(abs_path, workspace)
         )
-        privacy = classify_privacy_level(abs_path, size_bytes, self.config.max_parse_bytes)
+        privacy = most_restrictive_privacy_level(
+            classify_privacy_level(abs_path, size_bytes, self.config.max_parse_bytes),
+            classify_privacy_level(real_path, size_bytes, self.config.max_parse_bytes),
+        )
 
         if privacy == PrivacyLevel.VAULT_LOCKED:
             file_hash = f"vault_locked:{inode}:{size_bytes}:{int(mtime)}"
@@ -472,7 +561,12 @@ class KruschFSClient:
                 .first()
             )
 
-            if existing_by_path and existing_by_path.file_hash == file_hash and not existing_by_path.is_deleted:
+            if (
+                not force
+                and existing_by_path
+                and existing_by_path.file_hash == file_hash
+                and not existing_by_path.is_deleted
+            ):
                 existing_by_path.atime = atime
                 if handoff_repo and not existing_by_path.handoff_repo:
                     existing_by_path.handoff_repo = handoff_repo
@@ -532,9 +626,62 @@ class KruschFSClient:
                 auto_slots=auto_slots,
                 existing_by_path=existing_by_path,
                 _report=_report,
+                force=force,
             )
         finally:
             db.close()
+
+    def _mark_missing_files_deleted(
+        self,
+        db,
+        node_name: str,
+        scanned_roots: List[str],
+        seen_paths: set,
+        _report: Optional[SyncReport] = None,
+    ) -> None:
+        """Mark active FSFile rows under scanned_roots that were not seen in the scan as is_deleted=True."""
+        active_files = (
+            db.query(FSFile)
+            .filter(FSFile.host_node == node_name, FSFile.is_deleted == False)  # noqa: E712
+            .all()
+        )
+        norm_roots = []
+        for r in scanned_roots:
+            if not r:
+                continue
+            r_clean = r.rstrip("/")
+            norm_roots.append(r_clean)
+            if r_clean.startswith("~"):
+                exp_r = os.path.expanduser(r_clean).rstrip("/")
+                if exp_r != r_clean:
+                    norm_roots.append(exp_r)
+
+        def _is_under_roots(fpath: str) -> bool:
+            for nr in norm_roots:
+                if fpath == nr or fpath.startswith(nr + "/"):
+                    return True
+                if nr.startswith("~/"):
+                    rel_suffix = nr[1:]  # e.g. "/Documents"
+                    if rel_suffix and (fpath.endswith(rel_suffix) or (rel_suffix + "/") in fpath):
+                        return True
+            return False
+
+        for f in active_files:
+            if f.file_path in seen_paths:
+                continue
+            if not _is_under_roots(f.file_path):
+                continue
+            f.is_deleted = True
+            f.updated_at = datetime.now(timezone.utc)
+            db.query(FSChunk).filter(FSChunk.file_id == f.id).delete()
+            for mem in db.query(PageMemory).filter(PageMemory.file_id == f.id).all():
+                if not mem.is_drifted:
+                    mem.is_drifted = True
+                    if _report is not None:
+                        _report.memories_flagged_drifted += 1
+                else:
+                    mem.is_drifted = True
+        db.commit()
 
     def index_remote_entry(
         self,
@@ -542,6 +689,7 @@ class KruschFSClient:
         entry: Dict[str, Any],
         workspace: Optional[str] = None,
         _report: Optional[SyncReport] = None,
+        force: bool = False,
     ) -> Optional[FSFile]:
         """Index a file entry streamed over SSH from a remote fleet node (`compute-node-01`, `storage-node-01`, etc.)."""
         abs_path = entry["file_path"]
@@ -567,7 +715,12 @@ class KruschFSClient:
                 .filter(FSFile.host_node == host_node, FSFile.file_path == abs_path)
                 .first()
             )
-            if (entry.get("unchanged") or (existing_by_path and existing_by_path.file_hash == file_hash)) and existing_by_path:
+            if (
+                not force
+                and (entry.get("unchanged") or (existing_by_path and existing_by_path.file_hash == file_hash))
+                and existing_by_path
+                and not existing_by_path.is_deleted
+            ):
                 existing_by_path.atime = atime
                 db.commit()
                 if _report is not None:
@@ -632,6 +785,7 @@ class KruschFSClient:
                 auto_slots=auto_slots,
                 existing_by_path=existing_by_path,
                 _report=_report,
+                force=force,
             )
         finally:
             db.close()
@@ -642,12 +796,13 @@ class KruschFSClient:
         workspace: Optional[str] = None,
         register_watch_root: bool = True,
         host_node: Optional[str] = None,
+        force: bool = False,
     ) -> SyncReport:
         """Scan a local or remote directory/file into KruschFS."""
-        node_name = host_node or self.config.host_node
+        node_name = self._resolve_node(host_node)
         fleet_map = load_fleet_nodes()
         if node_name != self.config.host_node and node_name in fleet_map and not fleet_map[node_name].get("local"):
-            return self.scan_remote_node(node_name, roots=[target_path], workspace=workspace)
+            return self.scan_remote_node(node_name, roots=[target_path], workspace=workspace, force=force)
 
         t0 = time.perf_counter()
         abs_root = os.path.abspath(os.path.expanduser(target_path))
@@ -658,7 +813,7 @@ class KruschFSClient:
 
         if os.path.isfile(abs_root):
             report.files_discovered = 1
-            self.index_file(abs_root, workspace=workspace, host_node=node_name, _report=report)
+            self.index_file(abs_root, workspace=workspace, host_node=node_name, _report=report, force=force)
             report.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
             return report
 
@@ -688,12 +843,15 @@ class KruschFSClient:
             finally:
                 db.close()
 
+        seen_paths: set = set()
         for current_dir, dirnames, filenames in os.walk(abs_root, topdown=True):
             dirnames[:] = [
                 d
                 for d in sorted(dirnames)
                 if d not in (".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".ingested")
+                and not os.path.islink(os.path.join(current_dir, d))
                 and not should_ignore_path(os.path.join(current_dir, d))
+                and not should_ignore_path(os.path.realpath(os.path.join(current_dir, d)))
             ]
 
             if is_git_repo_root(current_dir):
@@ -701,22 +859,25 @@ class KruschFSClient:
                 report.repo_boundaries_handed_off += 1
                 for doc_candidate in ("README.md", "AGENTS.md"):
                     candidate_path = os.path.join(current_dir, doc_candidate)
-                    if os.path.isfile(candidate_path):
+                    if os.path.isfile(candidate_path) and not os.path.islink(candidate_path):
                         report.files_discovered += 1
-                        self.index_file(
+                        indexed = self.index_file(
                             candidate_path,
                             workspace=WorkspaceZone.REPO_BOUNDARIES.value,
                             handoff_repo=repo_name,
                             host_node=node_name,
                             _report=report,
+                            force=force,
                         )
+                        if indexed is not None:
+                            seen_paths.add(os.path.abspath(candidate_path))
                 env_dirs = [current_dir]
                 projects_sub = os.path.join(current_dir, "projects")
-                if os.path.isdir(projects_sub):
+                if os.path.isdir(projects_sub) and not os.path.islink(projects_sub):
                     try:
                         for sub in sorted(os.listdir(projects_sub)):
                             sub_p = os.path.join(projects_sub, sub)
-                            if os.path.isdir(sub_p):
+                            if os.path.isdir(sub_p) and not os.path.islink(sub_p):
                                 env_dirs.append(sub_p)
                     except Exception:
                         pass
@@ -728,12 +889,15 @@ class KruschFSClient:
                                 ep = os.path.join(ed, fn)
                                 if os.path.isfile(ep) and not os.path.islink(ep):
                                     report.files_discovered += 1
-                                    self.index_file(
+                                    indexed = self.index_file(
                                         ep,
                                         workspace=WorkspaceZone.SYSTEM_CONFIG.value,
                                         host_node=node_name,
                                         _report=report,
+                                        force=force,
                                     )
+                                    if indexed is not None:
+                                        seen_paths.add(os.path.abspath(ep))
                     except Exception:
                         pass
                 dirnames[:] = []
@@ -744,7 +908,21 @@ class KruschFSClient:
                 if should_ignore_path(fpath) or os.path.islink(fpath):
                     continue
                 report.files_discovered += 1
-                self.index_file(fpath, workspace=workspace, host_node=node_name, _report=report)
+                indexed = self.index_file(fpath, workspace=workspace, host_node=node_name, _report=report, force=force)
+                if indexed is not None:
+                    seen_paths.add(os.path.abspath(fpath))
+
+        db = self.SessionLocal()
+        try:
+            self._mark_missing_files_deleted(
+                db=db,
+                node_name=node_name,
+                scanned_roots=[abs_root],
+                seen_paths=seen_paths,
+                _report=report,
+            )
+        finally:
+            db.close()
 
         report.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return report
@@ -755,16 +933,17 @@ class KruschFSClient:
         roots: Optional[List[str]] = None,
         workspace: Optional[str] = None,
         ssh_target_override: Optional[str] = None,
+        force: bool = False,
     ) -> SyncReport:
         """Scan a remote computer on the fleet over SSH and index its pages into KruschFS."""
         t0 = time.perf_counter()
         fleet_map = load_fleet_nodes()
         node_cfg = fleet_map.get(node_name, {})
-        target_roots = [
-            os.path.expanduser(r) if r.startswith("~") else r
-            for r in (roots or node_cfg.get("default_roots", ["/etc/systemd/system", "/etc/fstab"]))
-        ]
+        target_roots = list(roots or node_cfg.get("default_roots", ["/etc/systemd/system", "/etc/fstab"]))
         report = SyncReport(host_node=node_name, scanned_paths=target_roots)
+
+        if ssh_target_override is not None and ssh_target_override.strip().startswith("-"):
+            raise ValueError(f"Invalid ssh_target_override: {ssh_target_override!r}")
 
         ssh_target = ssh_target_override or probe_node_ssh(node_name, fleet_map=fleet_map)
         if not ssh_target:
@@ -772,10 +951,14 @@ class KruschFSClient:
 
         db = self.SessionLocal()
         try:
-            known_hashes = {
-                f.file_path: f.file_hash
-                for f in db.query(FSFile).filter(FSFile.host_node == node_name, FSFile.is_deleted == False).all()  # noqa: E712
-            }
+            known_hashes = (
+                {}
+                if force
+                else {
+                    f.file_path: f.file_hash
+                    for f in db.query(FSFile).filter(FSFile.host_node == node_name, FSFile.is_deleted == False).all()  # noqa: E712
+                }
+            )
             for r_path in target_roots:
                 ws_zone = classify_workspace_zone(r_path, workspace)
                 wr = (
@@ -805,25 +988,43 @@ class KruschFSClient:
             known_hashes=known_hashes,
         )
         report.files_discovered = len(entries)
+        seen_remote_paths: set = set()
         for entry in entries:
+            if "file_path" in entry:
+                seen_remote_paths.add(entry["file_path"])
             self.index_remote_entry(
                 host_node=node_name,
                 entry=entry,
                 workspace=workspace,
                 _report=report,
+                force=force,
             )
+
+        db = self.SessionLocal()
+        try:
+            self._mark_missing_files_deleted(
+                db=db,
+                node_name=node_name,
+                scanned_roots=target_roots,
+                seen_paths=seen_remote_paths,
+                _report=report,
+            )
+        finally:
+            db.close()
 
         report.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return report
 
-    def sync_fleet(self, nodes: Optional[List[str]] = None) -> FleetSyncReport:
+    def sync_fleet(self, nodes: Optional[List[str]] = None, force: bool = False) -> FleetSyncReport:
         """
         Synchronize all computers configured in `~/.krusch-fs/fleet.json` (or the local workstation).
         Online nodes are indexed immediately; sleeping/offline edge nodes are skipped in <2s.
         """
         t0 = time.perf_counter()
         fleet_map = load_fleet_nodes()
-        target_nodes = nodes or list(fleet_map.keys())
+        target_nodes = [n for n in (nodes or list(fleet_map.keys())) if n and n.strip().lower() != "all"]
+        if not target_nodes:
+            target_nodes = list(fleet_map.keys())
         node_results: List[FleetNodeSyncResult] = []
 
         total_files = 0
@@ -850,7 +1051,7 @@ class KruschFSClient:
                 for r_path in cfg.get("default_roots", []):
                     exp_path = os.path.expanduser(r_path)
                     if os.path.exists(exp_path):
-                        sub = self.scan_path(exp_path, host_node=node_name)
+                        sub = self.scan_path(exp_path, host_node=node_name, force=force)
                         combined.scanned_paths.extend(sub.scanned_paths)
                         combined.files_discovered += sub.files_discovered
                         combined.files_indexed += sub.files_indexed
@@ -890,7 +1091,7 @@ class KruschFSClient:
                     )
                     continue
                 try:
-                    rep = self.scan_remote_node(node_name, ssh_target_override=ssh_target)
+                    rep = self.scan_remote_node(node_name, ssh_target_override=ssh_target, force=force)
                     online_cnt += 1
                     total_files += rep.files_indexed
                     total_pages += rep.pages_indexed
@@ -937,7 +1138,7 @@ class KruschFSClient:
         host_node: Optional[str] = None,
     ) -> PageMemoryItem:
         """Write-Through Page Memory Anchor (`krusch_fs_remember_on_page`) across local or remote fleet files."""
-        node_name = host_node or self.config.host_node
+        node_name = self._resolve_node(host_node)
         abs_path = os.path.abspath(os.path.expanduser(file_path)) if node_name == self.config.host_node else file_path
 
         if node_name == self.config.host_node and os.path.isfile(abs_path):
@@ -947,11 +1148,16 @@ class KruschFSClient:
         if not clean_quote:
             raise ValueError("quoted_sentence is required to anchor a memory to a specific page (INV-12).")
 
+        clean_content = (memory_content or "").strip()
         db = self.SessionLocal()
         try:
             fs_file = (
                 db.query(FSFile)
-                .filter(FSFile.host_node == node_name, FSFile.file_path == abs_path)
+                .filter(
+                    FSFile.host_node == node_name,
+                    FSFile.file_path == abs_path,
+                    FSFile.is_deleted == False,  # noqa: E712
+                )
                 .first()
             )
             if not fs_file:
@@ -996,6 +1202,32 @@ class KruschFSClient:
                 except Exception:
                     matched_bbox = None
 
+            existing_mem = (
+                db.query(PageMemory)
+                .filter(
+                    PageMemory.file_id == fs_file.id,
+                    PageMemory.page_number == fs_page.page_number,
+                    PageMemory.category == category,
+                    PageMemory.memory_key == memory_key,
+                    PageMemory.memory_content == clean_content,
+                    PageMemory.quoted_sentence == matched_verbatim,
+                )
+                .first()
+            )
+            if existing_mem is not None:
+                existing_mem.page_id = fs_page.id
+                existing_mem.printed_page = fs_page.printed_page
+                existing_mem.citation = fs_page.citation
+                existing_mem.locator = fs_page.locator or fs_page.section_header
+                existing_mem.bbox = json.dumps(matched_bbox) if matched_bbox else existing_mem.bbox
+                existing_mem.char_start = pos
+                existing_mem.char_end = end_pos
+                existing_mem.anchor_page_hash = fs_page.page_hash
+                existing_mem.is_drifted = False
+                db.commit()
+                db.refresh(existing_mem)
+                return self._memory_to_item(existing_mem, fs_file.file_path, fs_page.page_hash, fs_file.host_node)
+
             mem = PageMemory(
                 file_id=fs_file.id,
                 page_id=fs_page.id,
@@ -1004,7 +1236,7 @@ class KruschFSClient:
                 printed_page=fs_page.printed_page,
                 category=category,
                 memory_key=memory_key,
-                memory_content=memory_content.strip(),
+                memory_content=clean_content,
                 quoted_sentence=matched_verbatim,
                 citation=fs_page.citation,
                 locator=fs_page.locator or fs_page.section_header,
@@ -1014,7 +1246,7 @@ class KruschFSClient:
                 anchor_page_hash=fs_page.page_hash,
                 is_drifted=False,
                 auto_extracted=False,
-                embedding=self._embed(f"{memory_key or ''} {memory_content} {matched_verbatim}"),
+                embedding=self._embed(f"{memory_key or ''} {clean_content} {matched_verbatim}"),
             )
             db.add(mem)
             db.commit()
@@ -1025,7 +1257,7 @@ class KruschFSClient:
 
     def get_page_tree(self, file_path: str, host_node: Optional[str] = None) -> FilePageTree:
         """Return the PageIndex Table of Contents tree (`krusch_fs_page_tree`) for a local or remote fleet file."""
-        node_name = host_node or self.config.host_node
+        node_name = self._resolve_node(host_node)
         abs_path = os.path.abspath(os.path.expanduser(file_path)) if node_name == self.config.host_node else file_path
         if node_name == self.config.host_node and os.path.isfile(abs_path):
             self.index_file(abs_path, host_node=node_name)
@@ -1034,7 +1266,11 @@ class KruschFSClient:
         try:
             fs_file = (
                 db.query(FSFile)
-                .filter(FSFile.host_node == node_name, FSFile.file_path == abs_path)
+                .filter(
+                    FSFile.host_node == node_name,
+                    FSFile.file_path == abs_path,
+                    FSFile.is_deleted == False,  # noqa: E712
+                )
                 .first()
             )
             if not fs_file:
@@ -1103,7 +1339,7 @@ class KruschFSClient:
         host_node: Optional[str] = None,
     ) -> Union[PageView, List[PageView]]:
         """Hydrate a single page (or page range) of a local or remote fleet file (`krusch_fs_read_page`)."""
-        node_name = host_node or self.config.host_node
+        node_name = self._resolve_node(host_node)
         abs_path = os.path.abspath(os.path.expanduser(file_path)) if node_name == self.config.host_node else file_path
         if node_name == self.config.host_node and os.path.isfile(abs_path):
             self.index_file(abs_path, host_node=node_name)
@@ -1112,7 +1348,11 @@ class KruschFSClient:
         try:
             fs_file = (
                 db.query(FSFile)
-                .filter(FSFile.host_node == node_name, FSFile.file_path == abs_path)
+                .filter(
+                    FSFile.host_node == node_name,
+                    FSFile.file_path == abs_path,
+                    FSFile.is_deleted == False,  # noqa: E712
+                )
                 .first()
             )
             if not fs_file:
@@ -1487,8 +1727,18 @@ class KruschFSClient:
         db = self.SessionLocal()
         try:
             active_files = db.query(FSFile).filter(FSFile.is_deleted == False).all()  # noqa: E712
-            total_pages = db.query(FSPage).count()
-            total_chunks = db.query(FSChunk).count()
+            total_pages = (
+                db.query(FSPage)
+                .join(FSFile, FSPage.file_id == FSFile.id)
+                .filter(FSFile.is_deleted == False)  # noqa: E712
+                .count()
+            )
+            total_chunks = (
+                db.query(FSChunk)
+                .join(FSFile, FSChunk.file_id == FSFile.id)
+                .filter(FSFile.is_deleted == False)  # noqa: E712
+                .count()
+            )
             total_memories = db.query(PageMemory).count()
             drifted_memories = db.query(PageMemory).filter(PageMemory.is_drifted == True).count()  # noqa: E712
             roots = db.query(FSWatchRoot).all()
