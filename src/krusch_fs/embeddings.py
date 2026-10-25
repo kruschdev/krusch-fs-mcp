@@ -3,13 +3,14 @@ KruschFS Local Embedding & Similarity Helper (embeddings.py)
 ============================================================
 Provides zero-egress local embeddings (`INV-1`):
 - `deterministic`: Fast feature-hashed n-gram 1024-d unit vector (zero external daemon latency).
-- `ollama`: Local Ollama HTTP `/api/embeddings` (`bge-large`, 1024-d) with graceful fallback.
+- `ollama`: Local Ollama HTTP `/api/embed` (`bge-large`, 1024-d) with legacy `/api/embeddings` 404 fallback and graceful deterministic fallback.
 """
 
 import re
 import math
 import json
 import hashlib
+import urllib.error
 import urllib.request
 from typing import List
 
@@ -47,26 +48,79 @@ def embed_text(
     text: str,
     backend: str = "deterministic",
     ollama_url: str = "http://127.0.0.1:11434",
-    model: str = "bge-large",
+    model: str = "snowflake-arctic-embed2",
     dim: int = 1024,
 ) -> List[float]:
     """Generate a 1024-d embedding vector locally with zero cloud egress."""
     if backend == "ollama":
+        safe_text = text or ""
+        safe_model = model or "snowflake-arctic-embed2"
+        base_url = ollama_url.rstrip("/")
+        payload = {
+            "model": safe_model,
+            "input": safe_text[:8000],
+            "prompt": safe_text[:8000],
+            "truncate": True,
+            "keep_alive": -1,
+        }
+        if safe_model.startswith("qwen3-embedding"):
+            payload["dimensions"] = dim
+
+        vec = None
         try:
             req = urllib.request.Request(
-                f"{ollama_url.rstrip('/')}/api/embeddings",
-                data=json.dumps({"model": model, "prompt": text[:4000], "keep_alive": -1}).encode("utf-8"),
+                f"{base_url}/api/embed",
+                data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status == 200:
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
+                if getattr(resp, "status", 200) == 200:
                     data = json.loads(resp.read().decode("utf-8"))
-                    vec = data.get("embedding")
-                    if isinstance(vec, list) and len(vec) == dim:
-                        return vec
+                    embeddings = data.get("embeddings")
+                    vec = (
+                        embeddings[0]
+                        if isinstance(embeddings, list) and embeddings
+                        else data.get("embedding")
+                    )
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                try:
+                    legacy_req = urllib.request.Request(
+                        f"{base_url}/api/embeddings",
+                        data=json.dumps(
+                            {
+                                "model": safe_model,
+                                "prompt": safe_text[:1150],
+                                "truncate": True,
+                                "keep_alive": -1,
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(legacy_req, timeout=8.0) as resp:
+                        if getattr(resp, "status", 200) == 200:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            embeddings = data.get("embeddings")
+                            vec = (
+                                embeddings[0]
+                                if isinstance(embeddings, list) and embeddings
+                                else data.get("embedding")
+                            )
+                except Exception:
+                    pass
         except Exception:
             pass
+
+        if isinstance(vec, list) and len(vec) == dim:
+            try:
+                norm = math.sqrt(sum(float(v) * float(v) for v in vec))
+                if norm > 0.0:
+                    return [float(v) / norm for v in vec]
+                return [float(v) for v in vec]
+            except (TypeError, ValueError):
+                pass
     return _deterministic_token_vector(text, dim=dim)
 
 

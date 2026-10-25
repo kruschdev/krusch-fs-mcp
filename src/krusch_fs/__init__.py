@@ -24,11 +24,13 @@ from .models import (
 )
 from .fleet import FLEET_NODES
 from .client import KruschFSClient
+from .mcp import get_mcp
 
 __all__ = [
     "__version__",
     "FLEET_NODES",
     "KruschFSClient",
+    "get_mcp",
     "KruschFSConfig",
     "WorkspaceZone",
     "PrivacyLevel",

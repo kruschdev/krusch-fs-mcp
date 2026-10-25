@@ -15,14 +15,42 @@ import hashlib
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
-from krusch_nexus import (
-    PageData,
-    ContentBlock,
-    StructuredLocator,
-    ParserResult,
-    parse_file,
-    format_citation,
-)
+import sys
+
+try:
+    from krusch_nexus import (
+        PageData,
+        ContentBlock,
+        StructuredLocator,
+        ParserResult,
+        parse_file,
+        format_citation,
+    )
+except ImportError:
+    _nexus_candidates = [
+        os.getenv("KRUSCH_NEXUS_PATH"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "krusch-nexus", "src"),
+        "/home/agent/homelab/projects/krusch-nexus/src",
+        os.path.expanduser("~/homelab/projects/krusch-nexus/src"),
+    ]
+    for _cand in _nexus_candidates:
+        if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+            sys.path.insert(0, _cand)
+            break
+    try:
+        from krusch_nexus import (
+            PageData,
+            ContentBlock,
+            StructuredLocator,
+            ParserResult,
+            parse_file,
+            format_citation,
+        )
+    except ImportError as _exc:
+        raise RuntimeError(
+            "krusch_nexus is required for client operations; install with "
+            "'pip install krusch-nexus' or enable the 'krusch_nexus' extra."
+        ) from _exc
 
 from .models import WorkspaceZone, PrivacyLevel
 

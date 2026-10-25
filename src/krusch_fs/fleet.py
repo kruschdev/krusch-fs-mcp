@@ -20,12 +20,16 @@ Security & Performance Guarantees:
 4. Offline/sleeping nodes time out cleanly in <2s (`status="offline_skipped"`).
 """
 
+import inspect
 import os
 import json
+import logging
 import socket
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 
 def get_default_local_node_name() -> str:
@@ -36,7 +40,8 @@ def get_default_local_node_name() -> str:
     try:
         host = socket.gethostname().split(".")[0].strip()
         return host or "local"
-    except Exception:
+    except Exception as exc:
+        logger.debug("Falling back to default node name 'local': %s", exc)
         return "local"
 
 
@@ -60,23 +65,45 @@ def _build_default_local_fleet() -> Dict[str, Dict[str, Any]]:
     }
 
 
+def get_fleet_config_path() -> str:
+    """Resolve the fleet configuration file path from environment or default home path."""
+    return os.getenv(
+        "KRUSCH_FS_FLEET_CONFIG",
+        str(Path.home() / ".krusch-fs" / "fleet.json"),
+    )
+
+
+def validate_fleet_topology(data: Any) -> bool:
+    """Validate that loaded fleet JSON conforms to expected node topology structure."""
+    if not isinstance(data, dict) or not data:
+        return False
+    for node_name, spec in data.items():
+        if not isinstance(node_name, str) or not node_name.strip():
+            return False
+        if not isinstance(spec, dict):
+            return False
+        if "ssh_targets" in spec and not isinstance(spec["ssh_targets"], list):
+            return False
+        if "default_roots" in spec and not isinstance(spec["default_roots"], list):
+            return False
+    return True
+
+
 def load_fleet_nodes(config_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """
     Load multi-node fleet topology from `KRUSCH_FS_FLEET_CONFIG` or `~/.krusch-fs/fleet.json`.
     Falls back to a single local workstation entry when no external config file is present.
     """
-    target_path = config_path or os.getenv(
-        "KRUSCH_FS_FLEET_CONFIG",
-        str(Path.home() / ".krusch-fs" / "fleet.json"),
-    )
+    target_path = config_path or get_fleet_config_path()
     if target_path and os.path.isfile(target_path):
         try:
             with open(target_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and data:
+            if validate_fleet_topology(data):
                 return data
-        except Exception:
-            pass
+            logger.warning("Invalid fleet topology schema in %s; falling back to local default", target_path)
+        except Exception as exc:
+            logger.warning("Failed to load fleet topology from %s: %s", target_path, exc)
     return _build_default_local_fleet()
 
 
@@ -84,7 +111,7 @@ def load_fleet_nodes(config_path: Optional[str] = None) -> Dict[str, Dict[str, A
 FLEET_NODES: Dict[str, Dict[str, Any]] = load_fleet_nodes()
 
 # Self-contained Python 3 stdlib agent executed over SSH stdin (`python3 -`) on remote fleet nodes.
-REMOTE_SCANNER_SCRIPT_TEMPLATE = r'''
+_REMOTE_SCANNER_SCRIPT_BODY = r'''
 import os, sys, json, hashlib, re
 from pathlib import Path
 
@@ -113,40 +140,7 @@ TEXT_EXTS = {
 ENV_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 PRIV_RANK = {"standard": 0, "metadata_only": 1, "keys_only": 2, "vault_locked": 3}
 
-def should_ignore_path(path_str):
-    norm = os.path.abspath(path_str)
-    bname = os.path.basename(norm)
-    if (
-        bname.startswith((".lock.", ".~lock.", "~$"))
-        or bname.endswith((".swp", ".tmp", ".part", ".crdownload"))
-        or bname in (".DS_Store", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock", "poetry.lock", "uv.lock", "bun.lockb")
-    ):
-        return True
-    for prefix in IGNORED_PATH_PREFIXES:
-        if norm == prefix or norm.startswith(prefix + "/"):
-            return True
-    for part in Path(norm).parts:
-        if part in IGNORED_DIRS or part.endswith(("_venv", "-venv", "_env", "-env")):
-            return True
-    if os.path.isdir(norm) and os.path.isfile(os.path.join(norm, "pyvenv.cfg")):
-        return True
-    return False
-
-def classify_privacy(fpath, size_b):
-    name = os.path.basename(fpath)
-    low = name.lower()
-    ext = os.path.splitext(low)[1]
-    if name in VAULT_NAMES or ext in VAULT_EXTS:
-        return "vault_locked"
-    if "/.ssh/" in fpath and not low.endswith(("config", ".pub", "known_hosts")):
-        return "vault_locked"
-    if "/.gnupg/" in fpath:
-        return "vault_locked"
-    if low == ".env" or low.startswith(".env.") or low.endswith(".env") or "credentials" in low or "secret" in low:
-        return "keys_only"
-    if size_b > 256 * 1024 or (ext not in TEXT_EXTS and name not in ("fstab", "hosts", "hostname", "crontab")):
-        return "metadata_only"
-    return "standard"
+__SCANNER_HELPERS__
 
 def most_restrictive_privacy(p1, p2):
     return p1 if PRIV_RANK.get(p1, 0) >= PRIV_RANK.get(p2, 0) else p2
@@ -410,6 +404,81 @@ for raw_r in roots:
             except Exception:
                 continue
 '''
+
+IGNORED_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "mcp_env",
+    "site-packages", "dist-packages",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".next", ".nuxt", ".cache", ".ingested", "overlay2", "Trash", ".Trash",
+    ".local", ".mozilla", ".config", ".npm", ".cargo", ".rustup", ".ollama",
+    ".docker", "snap", ".vscode", ".cursor", ".gemini"
+}
+IGNORED_PATH_PREFIXES = ("/proc", "/sys", "/dev", "/run", "/var/lib/docker")
+VAULT_NAMES = {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "shadow", "gshadow", "master.key", "Cookies", "Login Data"}
+VAULT_EXTS = {".pem", ".key", ".p12", ".pfx", ".kdbx", ".keystore"}
+TEXT_EXTS = {
+    ".md", ".txt", ".rst", ".service", ".timer", ".target", ".mount",
+    ".conf", ".ini", ".toml", ".yaml", ".yml", ".json", ".sh", ".csv",
+    ".py", ".js", ".sql"
+}
+
+_SCANNER_IGNORED_DIRS = IGNORED_DIRS
+_SCANNER_IGNORED_PREFIXES = IGNORED_PATH_PREFIXES
+_SCANNER_VAULT_NAMES = VAULT_NAMES
+_SCANNER_VAULT_EXTS = VAULT_EXTS
+_SCANNER_TEXT_EXTS = TEXT_EXTS
+
+
+def should_ignore_path(path_str: str) -> bool:
+    """Validate and check whether a filesystem path should be ignored by the fleet scanner."""
+    if not isinstance(path_str, str) or not path_str.strip():
+        raise ValueError("path_str must be a non-empty string")
+    norm = os.path.abspath(path_str)
+    bname = os.path.basename(norm)
+    if (
+        bname.startswith((".lock.", ".~lock.", "~$"))
+        or bname.endswith((".swp", ".tmp", ".part", ".crdownload"))
+        or bname in (".DS_Store", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock", "poetry.lock", "uv.lock", "bun.lockb")
+    ):
+        return True
+    for prefix in IGNORED_PATH_PREFIXES:
+        if norm == prefix or norm.startswith(prefix + "/"):
+            return True
+    for part in Path(norm).parts:
+        if part in IGNORED_DIRS or part.endswith(("_venv", "-venv", "_env", "-env")):
+            return True
+    if os.path.isdir(norm) and os.path.isfile(os.path.join(norm, "pyvenv.cfg")):
+        return True
+    return False
+
+
+def classify_privacy(fpath: str, size_b: int) -> str:
+    """Validate inputs and classify a file path into its 3-Zone Privacy Shield tier."""
+    if not isinstance(fpath, str) or not fpath.strip():
+        raise ValueError("fpath must be a string")
+    if isinstance(size_b, bool) or not isinstance(size_b, (int, float)) or size_b < 0:
+        raise ValueError("size_b must be numeric")
+    size_b = int(size_b)
+    name = os.path.basename(fpath)
+    low = name.lower()
+    ext = os.path.splitext(low)[1]
+    if name in VAULT_NAMES or ext in VAULT_EXTS:
+        return "vault_locked"
+    if "/.ssh/" in fpath and not low.endswith(("config", ".pub", "known_hosts")):
+        return "vault_locked"
+    if "/.gnupg/" in fpath:
+        return "vault_locked"
+    if low == ".env" or low.startswith(".env.") or low.endswith(".env") or "credentials" in low or "secret" in low:
+        return "keys_only"
+    if size_b > 256 * 1024 or (ext not in TEXT_EXTS and name not in ("fstab", "hosts", "hostname", "crontab")):
+        return "metadata_only"
+    return "standard"
+
+
+REMOTE_SCANNER_SCRIPT_TEMPLATE = _REMOTE_SCANNER_SCRIPT_BODY.replace(
+    "__SCANNER_HELPERS__",
+    f"{inspect.getsource(should_ignore_path)}\n{inspect.getsource(classify_privacy)}",
+)
 
 
 def probe_node_ssh(node_name: str, timeout_sec: int = 2, fleet_map: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[str]:

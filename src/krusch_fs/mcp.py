@@ -9,6 +9,8 @@ on every registered tool.
 """
 
 import json
+import sys
+import threading
 from typing import Optional, List
 
 try:
@@ -39,20 +41,53 @@ except ImportError:
 
 from .client import KruschFSClient
 
-mcp = _MCPServerClass("krusch-fs")
-_client: Optional[KruschFSClient] = None
+_mcp_lock = threading.Lock()
+_mcp_instance = None
+
+
+def get_mcp():
+    """Return the thread-safe singleton MCPServer instance."""
+    global _mcp_instance
+    if _mcp_instance is None:
+        with _mcp_lock:
+            if _mcp_instance is None:
+                _mcp_instance = _MCPServerClass("krusch-fs")
+    return _mcp_instance
+
+
+mcp = get_mcp()
+
+
+class _ClientRegistry:
+    """Thread-safe holder for KruschFSClient without module-level global mutation."""
+
+    def __init__(self) -> None:
+        self._instance: Optional[KruschFSClient] = None
+        self._lock = threading.Lock()
+
+    def set(self, client: KruschFSClient) -> None:
+        with self._lock:
+            self._instance = client
+
+    def get(self, explicit_client: Optional[KruschFSClient] = None) -> KruschFSClient:
+        if explicit_client is not None:
+            return explicit_client
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:
+                    self._instance = KruschFSClient.from_env()
+        return self._instance
+
+
+_registry = _ClientRegistry()
 
 
 def set_client(client: KruschFSClient) -> None:
-    global _client
-    _client = client
+    _registry.set(client)
 
 
-def get_client() -> KruschFSClient:
-    global _client
-    if _client is None:
-        _client = KruschFSClient.from_env()
-    return _client
+def get_client(client: Optional[KruschFSClient] = None) -> KruschFSClient:
+    return _registry.get(client)
 
 
 READ_ONLY_ANNOTATIONS = ToolAnnotations(
@@ -355,10 +390,12 @@ def krusch_fs_sync(
         return json.dumps({"status": "error", "error": str(e)})
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> int:
     """Console script entrypoint for krusch-fs-mcp."""
+    _ = argv
     mcp.run(transport="stdio")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

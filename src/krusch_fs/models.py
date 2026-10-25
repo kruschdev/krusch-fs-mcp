@@ -58,7 +58,7 @@ class KruschFSConfig(BaseModel):
     host_node: str = Field(default_factory=_default_host_node)
     embed_backend: str = Field(default_factory=lambda: os.getenv("KRUSCH_FS_EMBED_BACKEND", "deterministic"))
     ollama_url: str = Field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://127.0.0.1:11434"))
-    embed_model: str = Field(default_factory=lambda: os.getenv("KRUSCH_FS_EMBED_MODEL", "bge-large"))
+    embed_model: str = Field(default_factory=lambda: os.getenv("KRUSCH_FS_EMBED_MODEL", "snowflake-arctic-embed2"))
     embed_dim: int = 1024
     max_parse_bytes: int = 50 * 1024 * 1024  # 50MB threshold before switching to metadata_only
 

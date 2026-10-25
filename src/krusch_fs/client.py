@@ -13,12 +13,37 @@ Implements:
 import os
 import re
 import json
+import logging
 import math
 import time
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Union
 
-from krusch_nexus import chunk_document_pages, format_citation
+import sys
+from . import config as fs_config
+
+logger = logging.getLogger("krusch_fs.client")
+
+try:
+    from krusch_nexus import chunk_document_pages, format_citation
+except ImportError:
+    _nexus_candidates = [
+        os.getenv("KRUSCH_NEXUS_PATH"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "krusch-nexus", "src"),
+        "/home/agent/homelab/projects/krusch-nexus/src",
+        os.path.expanduser("~/homelab/projects/krusch-nexus/src"),
+    ]
+    for _cand in _nexus_candidates:
+        if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+            sys.path.insert(0, _cand)
+            break
+    try:
+        from krusch_nexus import chunk_document_pages, format_citation
+    except ImportError as _exc:
+        raise RuntimeError(
+            "krusch_nexus is required for client operations; install with "
+            "'pip install krusch-nexus' or enable the 'krusch_nexus' extra."
+        ) from _exc
 
 from .models import (
     KruschFSConfig,
@@ -59,6 +84,27 @@ from .fleet import load_fleet_nodes, probe_node_ssh, stream_remote_node_entries
 QUERY_TOKEN_RE = re.compile(r"[a-z0-9_\.\-]{2,}")
 
 
+class InvalidPageNumberError(ValueError):
+    """Raised when page_number cannot be parsed as a valid integer."""
+
+
+class PageNumberOutOfRangeError(ValueError):
+    """Raised when page_number is less than 1 (1-based page index required)."""
+
+
+def _validate_page_number(page_number: object) -> int:
+    """Validate that page_number is a numeric integer >= 1 (1-based page index)."""
+    if isinstance(page_number, bool):
+        raise InvalidPageNumberError(f"Invalid page_number '{page_number}': must be a numeric integer.")
+    try:
+        parsed = int(page_number)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise InvalidPageNumberError(f"Invalid page_number '{page_number}': must be a numeric integer.") from exc
+    if parsed < 1:
+        raise PageNumberOutOfRangeError(f"page_number must be >= 1 (1-based page index), got {parsed}.")
+    return parsed
+
+
 class KruschFSClient:
     """Canonical client for the KruschFS OS & Page-Anchored Memory engine."""
 
@@ -89,18 +135,20 @@ class KruschFSClient:
         mem: PageMemory,
         file_path: str,
         current_page_hash: Optional[str] = None,
-        host_node: str = "krusch",
+        host_node: Optional[str] = None,
     ) -> PageMemoryItem:
+        resolved_node = fs_config.get_host_node(mem, host_node)
         bbox_val = None
         if mem.bbox:
             try:
                 bbox_val = json.loads(mem.bbox) if isinstance(mem.bbox, str) else list(mem.bbox)
-            except Exception:
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.error("BBox deserialization failed", exc_info=exc)
                 bbox_val = None
         is_drifted_bool = bool(mem.is_drifted)
         return PageMemoryItem(
             id=mem.id,
-            host_node=host_node,
+            host_node=resolved_node,
             file_id=mem.file_id,
             file_path=file_path,
             workspace=mem.workspace,
@@ -1021,7 +1069,47 @@ class KruschFSClient:
         Online nodes are indexed immediately; sleeping/offline edge nodes are skipped in <2s.
         """
         t0 = time.perf_counter()
-        fleet_map = load_fleet_nodes()
+        try:
+            raw_map = load_fleet_nodes()
+        except Exception as exc:
+            logger.error("Failed to load fleet nodes: %s", exc)
+            return FleetSyncReport(
+                total_nodes_configured=0,
+                nodes_online_indexed=0,
+                nodes_offline_skipped=0,
+                total_files_indexed=0,
+                total_pages_indexed=0,
+                total_memories_extracted=0,
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                nodes=[
+                    FleetNodeSyncResult(
+                        host_node="fleet_config",
+                        role="Configuration",
+                        status="error",
+                        error=f"Failed to load fleet nodes: {exc}",
+                    )
+                ],
+            )
+        if not isinstance(raw_map, dict):
+            logger.error("fleet_map is not a dict: %r", raw_map)
+            return FleetSyncReport(
+                total_nodes_configured=0,
+                nodes_online_indexed=0,
+                nodes_offline_skipped=0,
+                total_files_indexed=0,
+                total_pages_indexed=0,
+                total_memories_extracted=0,
+                duration_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+                nodes=[
+                    FleetNodeSyncResult(
+                        host_node="fleet_config",
+                        role="Configuration",
+                        status="error",
+                        error="Invalid fleet map",
+                    )
+                ],
+            )
+        fleet_map = raw_map
         target_nodes = [n for n in (nodes or list(fleet_map.keys())) if n and n.strip().lower() != "all"]
         if not target_nodes:
             target_nodes = list(fleet_map.keys())
@@ -1035,7 +1123,7 @@ class KruschFSClient:
 
         for node_name in target_nodes:
             cfg = fleet_map.get(node_name)
-            if not cfg:
+            if not isinstance(cfg, dict) or not cfg:
                 node_results.append(
                     FleetNodeSyncResult(
                         host_node=node_name,
@@ -1071,7 +1159,7 @@ class KruschFSClient:
                 node_results.append(
                     FleetNodeSyncResult(
                         host_node=node_name,
-                        role=cfg["role"],
+                        role=str(cfg.get("role", "Local Workstation")),
                         status="indexed",
                         ssh_target="local",
                         report=combined,
@@ -1137,7 +1225,12 @@ class KruschFSClient:
         memory_key: Optional[str] = None,
         host_node: Optional[str] = None,
     ) -> PageMemoryItem:
-        """Write-Through Page Memory Anchor (`krusch_fs_remember_on_page`) across local or remote fleet files."""
+        """Write-Through Page Memory Anchor (`krusch_fs_remember_on_page`) across local or remote fleet files.
+
+        Expects a 1-based page index (`page_number >= 1`).
+        """
+        # Validate page_number against non-numeric input and enforce 1-based page index (>= 1)
+        validated_page = _validate_page_number(page_number)
         node_name = self._resolve_node(host_node)
         abs_path = os.path.abspath(os.path.expanduser(file_path)) if node_name == self.config.host_node else file_path
 
@@ -1165,12 +1258,12 @@ class KruschFSClient:
 
             fs_page = (
                 db.query(FSPage)
-                .filter(FSPage.file_id == fs_file.id, FSPage.page_number == int(page_number))
+                .filter(FSPage.file_id == fs_file.id, FSPage.page_number == validated_page)
                 .first()
             )
             if not fs_page:
                 raise ValueError(
-                    f"Page {page_number} does not exist in {fs_file.file_name} (total_pages={fs_file.total_pages})."
+                    f"Page {validated_page} does not exist in {fs_file.file_name} (total_pages={fs_file.total_pages})."
                 )
 
             page_text = fs_page.page_text or ""

@@ -887,4 +887,127 @@ def test_fs08_fs09_fs10_busy_timeout_idempotent_remember_and_mcp_sync(fs_env):
     assert len(p1.memories) == 1
 
 
+def test_fs11_memory_to_item_host_node_env_and_upsert_parsed_file_pages(fs_env, monkeypatch):
+    from krusch_fs.store import PageMemory
+
+    client, root = fs_env
+    monkeypatch.setenv("KRUSCH_FS_NODE", "kruschdev-env-node")
+
+    dummy_mem = PageMemory(
+        id=999,
+        file_id=1,
+        workspace="homelab_projects",
+        page_number=1,
+        printed_page="1",
+        category="annotation",
+        memory_key="test_key",
+        memory_content="test content",
+        quoted_sentence="All backups must be encrypted with age.",
+        citation="idempotent.md p.1",
+        locator="Page 1",
+        anchor_page_hash="hash1",
+        is_drifted=0,
+    )
+    item = client._memory_to_item(dummy_mem, file_path="/tmp/idempotent.md")
+    assert item.host_node == "kruschdev-env-node"
+
+
+def test_scan_path_edge_cases_and_malformed_fleet_config(fs_env, tmp_path, caplog):
+    import logging
+    from krusch_fs.fleet import load_fleet_nodes
+
+    client, root = fs_env
+
+    # 1. Non-existent path raises FileNotFoundError
+    missing_path = root / "does_not_exist_12345.md"
+    with pytest.raises(FileNotFoundError, match="Path not found"):
+        client.scan_path(str(missing_path))
+
+    # 2. Directory scan with register_watch_root=False indexes files without adding a WatchRoot
+    sub_dir = root / "unwatched_subdir"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    (sub_dir / "note.md").write_text("# Unwatched\nHello world.\n", encoding="utf-8")
+    rep = client.scan_path(str(sub_dir), register_watch_root=False)
+    assert rep.files_indexed == 1
+    assert rep.pages_indexed == 1
+
+    # 3. Malformed fleet.json logs a warning and falls back to local default fleet
+    bad_fleet = tmp_path / "bad_fleet.json"
+    bad_fleet.write_text("{ invalid json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        nodes = load_fleet_nodes(str(bad_fleet))
+    assert isinstance(nodes, dict) and len(nodes) == 1
+    assert any("Failed to load fleet topology" in rec.message for rec in caplog.records)
+
+
+def test_remember_on_page_validates_page_number_and_client_registry(fs_env):
+    from krusch_fs.client import InvalidPageNumberError, PageNumberOutOfRangeError
+    from krusch_fs.mcp import get_client, set_client
+
+    client, root = fs_env
+    doc = root / "page_validation.md"
+    doc.write_text("# Page 1\nValid sentence.\n", encoding="utf-8")
+
+    with pytest.raises(InvalidPageNumberError, match="must be a numeric integer"):
+        client.remember_on_page(
+            file_path=str(doc),
+            page_number="not-a-number",  # type: ignore[arg-type]
+            memory_content="test",
+            quoted_sentence="Valid sentence.",
+        )
+
+    with pytest.raises(PageNumberOutOfRangeError, match="must be >= 1"):
+        client.remember_on_page(
+            file_path=str(doc),
+            page_number=0,
+            memory_content="test",
+            quoted_sentence="Valid sentence.",
+        )
+
+    set_client(client)
+    assert get_client() is client
+    assert get_client(client) is client
+
+
+def test_get_mcp_thread_safe_singleton_and_cli_validators():
+    import argparse
+    import threading
+    from krusch_fs.mcp import get_mcp, mcp
+    from krusch_fs.cli import validate_nodes, validate_path, validate_workspace, main as cli_main
+
+    # 1. Verify get_mcp() thread-safe singleton identity
+    results = []
+
+    def fetch_mcp():
+        results.append(get_mcp())
+
+    threads = [threading.Thread(target=fetch_mcp) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 8
+    assert all(inst is mcp for inst in results)
+
+    # 2. Verify CLI validators accept valid inputs and reject invalid/metacharacter inputs
+    assert validate_nodes("krusch,kruschdev,compute-node-01") == "krusch,kruschdev,compute-node-01"
+    assert validate_path("/etc/systemd/system") == "/etc/systemd/system"
+    assert validate_workspace("user_docs") == "user_docs"
+
+    for bad_node in ("", "   ", "-oProxyCommand=evil", "krusch;rm -rf /", "krusch,,kruschdev", "node$1"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            validate_nodes(bad_node)
+
+    for bad_path in ("", "   ", "-rf", "/tmp/test;id", "/tmp/`whoami`", "/tmp/bad\x00path"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            validate_path(bad_path)
+
+    for bad_ws in ("", "   ", "-bad", "user_docs;id", "bad/workspace", "ws$1"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            validate_workspace(bad_ws)
+
+    with pytest.raises(SystemExit):
+        cli_main(["sync-fleet", "--nodes", "krusch;evil"])
+
 
