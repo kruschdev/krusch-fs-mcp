@@ -16,10 +16,12 @@ import json
 import logging
 import math
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Tuple
 
 import sys
+from sqlalchemy import text, tuple_
 from . import config as fs_config
 
 logger = logging.getLogger("krusch_fs.client")
@@ -61,6 +63,9 @@ from .models import (
 )
 from .store import (
     create_db_session_factory,
+    pack_float32_vector,
+    resolve_stored_vector,
+    build_fts5_match_query,
     FSWatchRoot,
     FSFile,
     FSPage,
@@ -77,11 +82,70 @@ from .shield import (
     most_restrictive_privacy_level,
     parse_os_file_with_nexus,
     parse_remote_text_with_nexus,
+    scan_for_secret_leak,
 )
-from .embeddings import embed_text, cosine_similarity
+from .embeddings import (
+    embed_text,
+    embed_batch,
+    canonical_embed_model_tag,
+    calibrate_query_similarity,
+    fast_unit_dot,
+    cosine_similarity,
+)
 from .fleet import load_fleet_nodes, probe_node_ssh, stream_remote_node_entries
 
 QUERY_TOKEN_RE = re.compile(r"[a-z0-9_\.\-]{2,}")
+UNATTESTED_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{3,}")
+UNATTESTED_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "what", "where",
+    "when", "which", "who", "how", "why", "into", "onto", "over", "under",
+    "about", "all", "any", "are", "was", "were", "has", "have", "had",
+    "does", "did", "can", "will", "not", "file", "files", "page", "pages",
+    "node", "nodes", "find", "show", "list", "search",
+}
+
+
+def compute_unattested_query_terms(query: str, hits: List[PageSearchHit]) -> List[str]:
+    """
+    Identify non-stopword query terms (`len >= 3`) absent from all returned hits'
+    filenames, paths, headers, snippets, and attached `page_memories` (`INV-FS-BUDGET-04`).
+    """
+    if not query or not query.strip():
+        return []
+    candidate_terms: List[str] = []
+    seen = set()
+    for tok in UNATTESTED_TOKEN_RE.findall(query):
+        low = tok.lower()
+        if low in UNATTESTED_STOPWORDS or low.isdigit() or low in seen:
+            continue
+        seen.add(low)
+        candidate_terms.append(tok)
+    if not candidate_terms:
+        return []
+    if not hits:
+        return candidate_terms
+
+    parts: List[str] = []
+    for h in hits:
+        parts.append(
+            f"{h.host_node or ''} {h.file_name or ''} {h.file_path or ''} "
+            f"{h.header or ''} {h.locator or ''} {h.citation or ''} {h.snippet or ''}"
+        )
+        for m in h.page_memories or []:
+            parts.append(
+                f"{m.memory_key or ''} {m.memory_content or ''} "
+                f"{m.quoted_sentence or ''} {m.locator or ''}"
+            )
+    haystack = " ".join(parts).lower()
+    unattested: List[str] = []
+    for tok in candidate_terms:
+        low = tok.lower()
+        if low in haystack:
+            continue
+        if len(low) >= 5 and low.endswith("s") and not low.endswith("ss") and low[:-1] in haystack:
+            continue
+        unattested.append(tok)
+    return unattested
 
 
 class InvalidPageNumberError(ValueError):
@@ -110,6 +174,9 @@ class KruschFSClient:
 
     def __init__(self, config: Optional[KruschFSConfig] = None):
         self.config = config or KruschFSConfig()
+        self._is_sqlite = (self.config.db_url or "").strip().lower().startswith("sqlite")
+        self._vec_cache: "OrderedDict[tuple, Any]" = OrderedDict()
+        self._vec_cache_max = 16384
         self.engine, self.SessionLocal = create_db_session_factory(self.config.db_url)
 
     @classmethod
@@ -121,14 +188,74 @@ class KruschFSClient:
             return self.config.host_node
         return host_node.strip()
 
-    def _embed(self, text: str) -> List[float]:
+    def _active_model_tag(self) -> str:
+        return canonical_embed_model_tag(self.config.embed_backend, self.config.embed_model)
+
+    def _embed(self, text_val: str, mode: str = "document") -> Optional[List[float]]:
         return embed_text(
-            text=text,
+            text=text_val,
             backend=self.config.embed_backend,
             ollama_url=self.config.ollama_url,
             model=self.config.embed_model,
             dim=self.config.embed_dim,
+            mode=mode,
+            domain="fs",
         )
+
+    def _embed_batch(self, texts: List[str], mode: str = "document") -> List[Optional[List[float]]]:
+        return embed_batch(
+            texts=texts,
+            backend=self.config.embed_backend,
+            ollama_url=self.config.ollama_url,
+            model=self.config.embed_model,
+            dim=self.config.embed_dim,
+            mode=mode,
+            domain="fs",
+        )
+
+    def _encode_vector_columns(
+        self, vec: Optional[List[float]]
+    ) -> Tuple[Optional[List[float]], Optional[bytes], Optional[str]]:
+        if vec is None:
+            return None, None, None
+        blob = pack_float32_vector(vec, dim=self.config.embed_dim)
+        if blob is None:
+            return None, None, None
+        tag = self._active_model_tag()
+        if self._is_sqlite:
+            return None, blob, tag
+        return vec, blob, tag
+
+    def _resolve_cached_vec(
+        self,
+        table_tag: str,
+        row_id: int,
+        anchor_hash: str,
+        blob: Optional[bytes],
+        legacy_emb: Any,
+        row_model: Optional[str],
+        expected_tag: str,
+    ):
+        if blob is None and legacy_emb is None:
+            return None
+        cache_key = (table_tag, row_id, anchor_hash, row_model or "", expected_tag)
+        cached = self._vec_cache.get(cache_key)
+        if cached is not None:
+            self._vec_cache.move_to_end(cache_key)
+            return cached
+        resolved = resolve_stored_vector(
+            embedding_blob=blob,
+            legacy_embedding=legacy_emb,
+            row_embed_model=row_model,
+            expected_model_tag=expected_tag,
+            dim=self.config.embed_dim,
+        )
+        if resolved is not None:
+            self._vec_cache[cache_key] = resolved
+            self._vec_cache.move_to_end(cache_key)
+            while len(self._vec_cache) > self._vec_cache_max:
+                self._vec_cache.popitem(last=False)
+        return resolved
 
     @staticmethod
     def _memory_to_item(
@@ -262,6 +389,7 @@ class KruschFSClient:
         seen_page_numbers = set()
         live_pages_by_num: Dict[int, FSPage] = {}
         changed_or_removed_pages = set()
+        pending_embed_records: List[Tuple[Any, str]] = []
 
         for page_idx, page_data in enumerate(parsed_res.pages, start=1):
             p_num = page_data.index or page_idx
@@ -372,55 +500,66 @@ class KruschFSClient:
                             sliced == nc_text
                             or " ".join(sliced.split()) == " ".join(nc_text.split())
                         )
-                    db.add(
-                        FSChunk(
-                            file_id=fs_file.id,
-                            page_id=fs_page.id,
-                            workspace=target_ws,
-                            page_number=p_num,
-                            printed_page=nc.printed_page or page_data.printed_page,
-                            chunk_index=c_idx,
-                            citation=c_cit,
-                            header=nc.header or sec_hdr,
-                            locator=nc.locator or page_data.locator,
-                            content="" if can_slice else nc_text,
-                            source_hash=nc.source_hash,
-                            char_start=c_start,
-                            char_end=c_end,
-                            bbox=json.dumps(nc.bbox) if nc.bbox else None,
-                            embedding=self._embed(f"{sec_hdr or ''} {nc_text}"),
-                        )
+                    chunk_obj = FSChunk(
+                        file_id=fs_file.id,
+                        page_id=fs_page.id,
+                        workspace=target_ws,
+                        page_number=p_num,
+                        printed_page=nc.printed_page or page_data.printed_page,
+                        chunk_index=c_idx,
+                        citation=c_cit,
+                        header=nc.header or sec_hdr,
+                        locator=nc.locator or page_data.locator,
+                        content="" if can_slice else nc_text,
+                        source_hash=nc.source_hash,
+                        char_start=c_start,
+                        char_end=c_end,
+                        bbox=json.dumps(nc.bbox) if nc.bbox else None,
                     )
+                    pending_embed_records.append((chunk_obj, f"{sec_hdr or ''} {nc_text}"))
             if _report is not None:
                 _report.pages_indexed += 1
 
             page_slots = [s for s in auto_slots if s.get("page_number") == p_num]
             for slot in page_slots:
-                db.add(
-                    PageMemory(
-                        file_id=fs_file.id,
-                        page_id=fs_page.id,
-                        workspace=target_ws,
-                        page_number=p_num,
-                        printed_page=page_data.printed_page,
-                        category=slot.get("category", "slot"),
-                        memory_key=slot.get("memory_key"),
-                        memory_content=slot["memory_content"],
-                        quoted_sentence=slot["quoted_sentence"],
-                        citation=cit,
-                        locator=slot.get("locator") or page_data.locator,
-                        char_start=slot.get("char_start", 0),
-                        char_end=slot.get("char_end", len(slot["quoted_sentence"])),
-                        anchor_page_hash=p_hash,
-                        is_drifted=False,
-                        auto_extracted=True,
-                        embedding=self._embed(
-                            f"{slot.get('memory_key', '')} {slot['memory_content']} {slot['quoted_sentence']}"
-                        ),
+                slot_obj = PageMemory(
+                    file_id=fs_file.id,
+                    page_id=fs_page.id,
+                    workspace=target_ws,
+                    page_number=p_num,
+                    printed_page=page_data.printed_page,
+                    category=slot.get("category", "slot"),
+                    memory_key=slot.get("memory_key"),
+                    memory_content=slot["memory_content"],
+                    quoted_sentence=slot["quoted_sentence"],
+                    citation=cit,
+                    locator=slot.get("locator") or page_data.locator,
+                    char_start=slot.get("char_start", 0),
+                    char_end=slot.get("char_end", len(slot["quoted_sentence"])),
+                    anchor_page_hash=p_hash,
+                    is_drifted=False,
+                    auto_extracted=True,
+                )
+                pending_embed_records.append(
+                    (
+                        slot_obj,
+                        f"{slot.get('memory_key', '')} {slot['memory_content']} {slot['quoted_sentence']}",
                     )
                 )
                 if _report is not None:
                     _report.memories_auto_extracted += 1
+
+        if pending_embed_records:
+            batch_vecs = self._embed_batch(
+                [txt for _, txt in pending_embed_records],
+                mode="document",
+            )
+            for (rec_obj, _), vec in zip(pending_embed_records, batch_vecs):
+                leg_emb, emb_blob, emb_tag = self._encode_vector_columns(vec)
+                rec_obj.embedding = leg_emb
+                rec_obj.embedding_blob = emb_blob
+                rec_obj.embed_model = emb_tag
+                db.add(rec_obj)
 
         for old_p_num, old_p in existing_pages.items():
             if old_p_num not in seen_page_numbers:
@@ -1234,14 +1373,24 @@ class KruschFSClient:
         node_name = self._resolve_node(host_node)
         abs_path = os.path.abspath(os.path.expanduser(file_path)) if node_name == self.config.host_node else file_path
 
-        if node_name == self.config.host_node and os.path.isfile(abs_path):
-            self.index_file(abs_path, host_node=node_name)
-
         clean_quote = (quoted_sentence or "").strip()
         if not clean_quote:
             raise ValueError("quoted_sentence is required to anchor a memory to a specific page (INV-12).")
 
         clean_content = (memory_content or "").strip()
+        leak_reason = (
+            scan_for_secret_leak(clean_content)
+            or (scan_for_secret_leak(memory_key) if memory_key else None)
+            or scan_for_secret_leak(clean_quote)
+        )
+        if leak_reason:
+            raise ValueError(
+                f"Secret Shield blocked page memory write (INV-FS-BUDGET-04): detected {leak_reason}."
+            )
+
+        if node_name == self.config.host_node and os.path.isfile(abs_path):
+            self.index_file(abs_path, host_node=node_name)
+
         db = self.SessionLocal()
         try:
             fs_file = (
@@ -1307,6 +1456,7 @@ class KruschFSClient:
                 )
                 .first()
             )
+            active_tag = self._active_model_tag()
             if existing_mem is not None:
                 existing_mem.page_id = fs_page.id
                 existing_mem.printed_page = fs_page.printed_page
@@ -1317,10 +1467,26 @@ class KruschFSClient:
                 existing_mem.char_end = end_pos
                 existing_mem.anchor_page_hash = fs_page.page_hash
                 existing_mem.is_drifted = False
+                if existing_mem.embed_model != active_tag or (
+                    existing_mem.embedding_blob is None and existing_mem.embedding is None
+                ):
+                    vec = self._embed(
+                        f"{memory_key or ''} {clean_content} {matched_verbatim}",
+                        mode="document",
+                    )
+                    leg_emb, emb_blob, emb_tag = self._encode_vector_columns(vec)
+                    existing_mem.embedding = leg_emb
+                    existing_mem.embedding_blob = emb_blob
+                    existing_mem.embed_model = emb_tag
                 db.commit()
                 db.refresh(existing_mem)
                 return self._memory_to_item(existing_mem, fs_file.file_path, fs_page.page_hash, fs_file.host_node)
 
+            vec = self._embed(
+                f"{memory_key or ''} {clean_content} {matched_verbatim}",
+                mode="document",
+            )
+            leg_emb, emb_blob, emb_tag = self._encode_vector_columns(vec)
             mem = PageMemory(
                 file_id=fs_file.id,
                 page_id=fs_page.id,
@@ -1339,7 +1505,9 @@ class KruschFSClient:
                 anchor_page_hash=fs_page.page_hash,
                 is_drifted=False,
                 auto_extracted=False,
-                embedding=self._embed(f"{memory_key or ''} {clean_content} {matched_verbatim}"),
+                embedding=leg_emb,
+                embedding_blob=emb_blob,
+                embed_model=emb_tag,
             )
             db.add(mem)
             db.commit()
@@ -1522,16 +1690,18 @@ class KruschFSClient:
         limit: int = 5,
         node: Optional[str] = None,
         top_k: Optional[int] = None,
+        limit_tokens: Optional[int] = None,
     ) -> List[PageSearchHit]:
         """
         Hybrid RRF Search (`krusch_fs_search`) across all fleet nodes (or a specific `host_node`).
+        Uses SQLite external-content Porter FTS5 + IEEE-754 Float32 `math.sumprod` + lazy Top-K `FSPage` hydration.
         """
         q_clean = (query or "").strip()
         if not q_clean:
             return []
 
         effective_node = host_node or node
-        effective_limit = top_k if top_k is not None else limit
+        effective_limit = max(1, int(top_k if top_k is not None else limit))
         cat_norm = (category or "").strip().lower()
         mem_category: Optional[str] = category
         if cat_norm in ("", "all", "*"):
@@ -1543,51 +1713,157 @@ class KruschFSClient:
             workspace = workspace or WorkspaceZone.USER_DOCS.value
             mem_category = None
 
-        q_vec = self._embed(q_clean)
-        q_tokens = set(QUERY_TOKEN_RE.findall(q_clean.lower()))
+        active_tag = self._active_model_tag()
+        q_vec = self._embed(q_clean, mode="query")
+        q_lower = q_clean.lower()
+        q_tokens = set(QUERY_TOKEN_RE.findall(q_lower))
         now_ts = time.time()
 
         db = self.SessionLocal()
         try:
+            has_file_filter = False
             file_q = db.query(FSFile).filter(FSFile.is_deleted == False)  # noqa: E712
             if effective_node and effective_node != "all":
                 file_q = file_q.filter(FSFile.host_node == effective_node)
+                has_file_filter = True
             if workspace and workspace != "all":
                 file_q = file_q.filter(FSFile.workspace == workspace)
+                has_file_filter = True
             if path_prefix:
                 abs_pref = os.path.expanduser(path_prefix)
                 file_q = file_q.filter(FSFile.file_path.like(f"{abs_pref}%"))
+                has_file_filter = True
 
             files_map: Dict[int, FSFile] = {f.id: f for f in file_q.all()}
             if not files_map:
                 return []
 
             valid_file_ids = list(files_map.keys())
-            pages_map: Dict[tuple, FSPage] = {
-                (p.file_id, p.page_number): p
-                for p in db.query(FSPage).filter(FSPage.file_id.in_(valid_file_ids)).all()
-            }
+            use_sql_in = has_file_filter and len(valid_file_ids) <= 800
 
-            all_mems = (
-                db.query(PageMemory)
-                .filter(PageMemory.file_id.in_(valid_file_ids))
-                .order_by(PageMemory.id.asc())
-                .all()
-            )
-            mems_by_file_page: Dict[tuple, List[PageMemory]] = {}
+            fts_page_scores: Dict[Tuple[int, int], float] = {}
+            fts_mem_scores: Dict[int, float] = {}
+            fts_active = False
+
+            if self._is_sqlite:
+                fts_match = build_fts5_match_query(q_clean)
+                if fts_match:
+                    try:
+                        page_fts_rows = db.execute(
+                            text(
+                                "SELECT p.file_id, p.page_number, "
+                                "-bm25(fs_pages_fts, 2.0, 1.5, 1.0, 1.0) AS score "
+                                "FROM fs_pages_fts "
+                                "JOIN fs_pages p ON p.id = fs_pages_fts.rowid "
+                                "WHERE fs_pages_fts MATCH :q"
+                            ),
+                            {"q": fts_match},
+                        ).fetchall()
+                        fts_active = True
+                        for fid, pnum, raw_bm25 in page_fts_rows:
+                            if fid not in files_map:
+                                continue
+                            val = max(0.0, float(raw_bm25 or 0.0))
+                            norm_bm25 = (val / (val + 1.5)) if val > 0.0 else 0.0
+                            pkey = (int(fid), int(pnum))
+                            if norm_bm25 > fts_page_scores.get(pkey, 0.0):
+                                fts_page_scores[pkey] = norm_bm25
+
+                        if include_memories:
+                            mem_fts_rows = db.execute(
+                                text(
+                                    "SELECT m.id, -bm25(page_memories_fts, 2.5, 1.5, 1.0, 1.0) AS score "
+                                    "FROM page_memories_fts "
+                                    "JOIN page_memories m ON m.id = page_memories_fts.rowid "
+                                    "WHERE page_memories_fts MATCH :q"
+                                ),
+                                {"q": fts_match},
+                            ).fetchall()
+                            for mid, raw_bm25 in mem_fts_rows:
+                                val = max(0.0, float(raw_bm25 or 0.0))
+                                if val > 0.0:
+                                    fts_mem_scores[int(mid)] = val / (val + 1.5)
+                    except Exception:
+                        fts_active = False
+                else:
+                    try:
+                        has_fts_tbl = db.execute(
+                            text(
+                                "SELECT 1 FROM sqlite_master "
+                                "WHERE type='table' AND name='fs_pages_fts'"
+                            )
+                        ).scalar()
+                        fts_active = bool(has_fts_tbl)
+                    except Exception:
+                        fts_active = False
+
+            # Only non-SQLite (or builds without FTS5) needs fallback page_text for lexical scoring
+            fallback_page_texts: Dict[Tuple[int, int], str] = {}
+            if not fts_active and not mem_category:
+                fb_q = db.query(FSPage.file_id, FSPage.page_number, FSPage.page_text)
+                if use_sql_in:
+                    fb_q = fb_q.filter(FSPage.file_id.in_(valid_file_ids))
+                for fid, pnum, ptxt in fb_q.all():
+                    if fid in files_map:
+                        fallback_page_texts[(fid, pnum)] = ptxt or ""
+
+            mem_q = db.query(PageMemory)
+            if use_sql_in:
+                mem_q = mem_q.filter(PageMemory.file_id.in_(valid_file_ids))
+            all_mems = [
+                m for m in mem_q.order_by(PageMemory.id.asc()).all() if m.file_id in files_map
+            ]
+            mems_by_file_page: Dict[Tuple[int, int], List[PageMemory]] = {}
             for m in all_mems:
                 mems_by_file_page.setdefault((m.file_id, m.page_number), []).append(m)
 
-            candidates: Dict[tuple, Dict[str, Any]] = {}
+            candidates: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+            def _is_exact_memory_key(mem_key: Optional[str]) -> bool:
+                if not mem_key:
+                    return False
+                mk = mem_key.strip().lower()
+                if not mk:
+                    return False
+                if mk == q_lower or mk in q_tokens:
+                    return True
+                return (
+                    re.search(rf"(?<![a-z0-9_]){re.escape(mk)}(?![a-z0-9_])", q_lower)
+                    is not None
+                )
 
             def _lexical_score(text_blob: str) -> float:
                 if not q_tokens or not text_blob:
                     return 0.0
                 lower_blob = text_blob.lower()
+                if not any(tok in lower_blob for tok in q_tokens):
+                    return 0.0
                 blob_tokens = set(QUERY_TOKEN_RE.findall(lower_blob))
                 overlap = len(q_tokens & blob_tokens) / max(1, len(q_tokens))
-                phrase_bonus = 0.35 if q_clean.lower() in lower_blob else 0.0
+                phrase_bonus = 0.35 if q_lower in lower_blob else 0.0
                 return overlap + phrase_bonus
+
+            q_vec_is_sparse = False
+            if q_vec is not None and len(q_vec) > 0:
+                q_sample = q_vec[:64]
+                q_vec_is_sparse = (
+                    sum(1 for x in q_sample if abs(float(x)) > 1e-7) < min(12, len(q_sample))
+                )
+
+            def _dense_score(doc_vec) -> float:
+                if q_vec is None or doc_vec is None:
+                    return 0.0
+                raw_cos = fast_unit_dot(q_vec, doc_vec)
+                if raw_cos <= 0.0:
+                    return 0.0
+                if q_vec_is_sparse:
+                    return min(1.0, float(raw_cos))
+                return calibrate_query_similarity(
+                    raw_cos,
+                    model=self.config.embed_model,
+                    backend=self.config.embed_backend,
+                    query_vec=None,
+                )
 
             if include_memories:
                 for m in all_mems:
@@ -1596,11 +1872,27 @@ class KruschFSClient:
                     f_obj = files_map.get(m.file_id)
                     if not f_obj:
                         continue
-                    searchable = f"{f_obj.host_node} {f_obj.file_name} {m.memory_key or ''} {m.memory_content} {m.quoted_sentence} {m.locator or ''}"
-                    lex = _lexical_score(searchable)
-                    dense = cosine_similarity(q_vec, m.embedding or [])
-                    key_exact = 0.5 if (m.memory_key and m.memory_key.lower() in q_clean.lower()) else 0.0
-                    raw_score = (0.55 * dense) + (0.45 * lex) + key_exact
+                    searchable = (
+                        f"{f_obj.host_node} {f_obj.file_name} {m.memory_key or ''} "
+                        f"{m.memory_content} {m.quoted_sentence} {m.locator or ''}"
+                    )
+                    lex = max(_lexical_score(searchable), fts_mem_scores.get(m.id, 0.0))
+                    m_vec = self._resolve_cached_vec(
+                        "mem",
+                        m.id,
+                        m.anchor_page_hash or "",
+                        m.embedding_blob,
+                        m.embedding,
+                        m.embed_model,
+                        active_tag,
+                    )
+                    dense = _dense_score(m_vec)
+                    key_exact = 0.5 if _is_exact_memory_key(m.memory_key) else 0.0
+                    raw_score = (
+                        (lex + key_exact)
+                        if q_vec is None
+                        else ((0.55 * dense) + (0.45 * lex) + key_exact)
+                    )
                     if raw_score <= 0.05:
                         continue
 
@@ -1625,6 +1917,7 @@ class KruschFSClient:
                             "match_source": "page_memory" if entry is None else "hybrid_page_and_memory",
                             "match_reasons": reasons,
                             "snippet": f"[Memory: {m.memory_content}] (Quote: \"{m.quoted_sentence}\")",
+                            "needs_page_slice": False,
                             "header": m.locator,
                             "locator": m.locator,
                             "citation": m.citation,
@@ -1634,75 +1927,182 @@ class KruschFSClient:
                         }
 
             if not mem_category:
-                chunks = db.query(FSChunk).filter(FSChunk.file_id.in_(valid_file_ids)).all()
-                for c in chunks:
-                    f_obj = files_map.get(c.file_id)
+                chunk_q = db.query(
+                    FSChunk.id,
+                    FSChunk.file_id,
+                    FSChunk.page_number,
+                    FSChunk.citation,
+                    FSChunk.header,
+                    FSChunk.locator,
+                    FSChunk.content,
+                    FSChunk.source_hash,
+                    FSChunk.char_start,
+                    FSChunk.char_end,
+                    FSChunk.bbox,
+                    FSChunk.embedding_blob,
+                    FSChunk.embedding,
+                    FSChunk.embed_model,
+                )
+                if use_sql_in:
+                    chunk_q = chunk_q.filter(FSChunk.file_id.in_(valid_file_ids))
+                for (
+                    c_id,
+                    c_file_id,
+                    c_page_num,
+                    c_citation,
+                    c_header,
+                    c_locator,
+                    c_content,
+                    c_source_hash,
+                    c_char_start,
+                    c_char_end,
+                    c_bbox,
+                    c_emb_blob,
+                    c_legacy_emb,
+                    c_emb_model,
+                ) in chunk_q.all():
+                    f_obj = files_map.get(c_file_id)
                     if not f_obj:
                         continue
-                    p_obj = pages_map.get((c.file_id, c.page_number))
-                    chunk_text = c.content
-                    if not chunk_text and p_obj and p_obj.page_text:
-                        if c.char_start is not None and c.char_end is not None:
-                            chunk_text = p_obj.page_text[c.char_start:c.char_end]
-                        else:
-                            chunk_text = p_obj.page_text
-                    chunk_text = chunk_text or ""
-                    searchable = f"{f_obj.host_node} {f_obj.file_name} {c.header or ''} {c.locator or ''} {chunk_text}"
-                    lex = _lexical_score(searchable)
-                    dense = cosine_similarity(q_vec, c.embedding or [])
-                    raw_score = (0.50 * dense) + (0.50 * lex)
+                    key = (c_file_id, c_page_num)
+                    inline_text = c_content or ""
+                    if not inline_text and not fts_active:
+                        fb_txt = fallback_page_texts.get(key, "")
+                        if fb_txt:
+                            if c_char_start is not None and c_char_end is not None:
+                                inline_text = fb_txt[c_char_start:c_char_end]
+                            else:
+                                inline_text = fb_txt
+
+                    searchable = (
+                        f"{f_obj.host_node} {f_obj.file_name} {c_header or ''} "
+                        f"{c_locator or ''} {inline_text}"
+                    )
+                    lex = max(_lexical_score(searchable), fts_page_scores.get(key, 0.0))
+                    c_vec = self._resolve_cached_vec(
+                        "chk",
+                        c_id,
+                        c_source_hash or "",
+                        c_emb_blob,
+                        c_legacy_emb,
+                        c_emb_model,
+                        active_tag,
+                    )
+                    dense = _dense_score(c_vec)
+                    raw_score = lex if q_vec is None else ((0.50 * dense) + (0.50 * lex))
                     if raw_score <= 0.05:
                         continue
 
-                    key = (c.file_id, c.page_number)
                     existing = candidates.get(key)
                     if existing is None:
                         bbox_val = None
-                        if c.bbox:
+                        if c_bbox:
                             try:
-                                bbox_val = json.loads(c.bbox)
+                                bbox_val = json.loads(c_bbox)
                             except Exception:
                                 bbox_val = None
                         candidates[key] = {
                             "raw_score": raw_score,
                             "match_source": "page_chunk",
                             "match_reasons": ["hybrid_chunk_match"],
-                            "snippet": chunk_text[:300].strip(),
-                            "header": c.header,
-                            "locator": c.locator,
-                            "citation": c.citation,
+                            "snippet": inline_text[:300].strip(),
+                            "needs_page_slice": not bool(inline_text),
+                            "header": c_header,
+                            "locator": c_locator,
+                            "citation": c_citation,
                             "bbox": bbox_val,
-                            "char_start": c.char_start,
-                            "char_end": c.char_end,
+                            "char_start": c_char_start,
+                            "char_end": c_char_end,
                         }
                     else:
                         is_memory_upgrade = existing["match_source"] == "page_memory"
                         if raw_score > existing["raw_score"] and not is_memory_upgrade:
-                            existing["snippet"] = chunk_text[:300].strip()
-                            existing["header"] = c.header
-                            existing["locator"] = c.locator
-                            existing["citation"] = c.citation
-                            existing["char_start"] = c.char_start
-                            existing["char_end"] = c.char_end
-                        existing["raw_score"] = max(existing["raw_score"], raw_score) + (0.15 if is_memory_upgrade else 0.0)
+                            existing["snippet"] = inline_text[:300].strip()
+                            existing["needs_page_slice"] = not bool(inline_text)
+                            existing["header"] = c_header
+                            existing["locator"] = c_locator
+                            existing["citation"] = c_citation
+                            existing["char_start"] = c_char_start
+                            existing["char_end"] = c_char_end
+                        existing["raw_score"] = max(existing["raw_score"], raw_score) + (
+                            0.15 if is_memory_upgrade else 0.0
+                        )
                         if is_memory_upgrade:
                             existing["match_source"] = "hybrid_page_and_memory"
                         if "hybrid_chunk_match" not in existing["match_reasons"]:
                             existing["match_reasons"].append("hybrid_chunk_match")
 
-            hits: List[PageSearchHit] = []
+            if not candidates:
+                return []
+
+            # Score & rank BEFORE hydrating FSPage (`INV-FS-FTS5-03`: lazy Top-K hydration only!)
+            scored_keys: List[Tuple[float, Tuple[int, int], Dict[str, Any]]] = []
             for (file_id, page_num), cand in candidates.items():
                 f_obj = files_map[file_id]
-                p_obj = pages_map.get((file_id, page_num))
                 age_mod_days = max(0.0, (now_ts - (f_obj.mtime or now_ts)) / 86400.0)
                 age_acc_days = max(0.0, (now_ts - (f_obj.atime or f_obj.mtime or now_ts)) / 86400.0)
                 decay = 0.7 * math.exp(-0.005 * age_mod_days) + 0.3 * math.exp(-0.01 * age_acc_days)
                 final_score = round(cand["raw_score"] * decay, 4)
+                scored_keys.append((final_score, (file_id, page_num), cand))
 
-                p_hash = p_obj.page_hash if p_obj else ""
-                page_mems = [
+            scored_keys.sort(key=lambda item: item[0], reverse=True)
+            top_scored = scored_keys[:effective_limit]
+
+            top_pairs = [pair for _, pair, _ in top_scored]
+            hydrated_pages: Dict[Tuple[int, int], Tuple[str, Optional[str], str]] = {}
+            if top_pairs:
+                page_rows = (
+                    db.query(
+                        FSPage.file_id,
+                        FSPage.page_number,
+                        FSPage.page_hash,
+                        FSPage.printed_page,
+                        FSPage.page_text,
+                    )
+                    .filter(tuple_(FSPage.file_id, FSPage.page_number).in_(top_pairs))
+                    .all()
+                )
+                for fid, pnum, phash, pprinted, ptxt in page_rows:
+                    hydrated_pages[(fid, pnum)] = (phash or "", pprinted, ptxt or "")
+
+            hits: List[PageSearchHit] = []
+            for final_score, (file_id, page_num), cand in top_scored:
+                f_obj = files_map[file_id]
+                p_hash, p_printed, p_text = hydrated_pages.get((file_id, page_num), ("", None, ""))
+
+                snippet = cand["snippet"]
+                if (not snippet or cand.get("needs_page_slice")) and p_text:
+                    c_start = cand["char_start"]
+                    c_end = cand["char_end"]
+                    if c_start is not None and c_end is not None:
+                        sliced = p_text[c_start:c_end]
+                    else:
+                        sliced = p_text
+                    snippet = (sliced or p_text)[:300].strip()
+
+                raw_page_mems = mems_by_file_page.get((file_id, page_num), [])
+                pinned_mems = [m for m in raw_page_mems if not m.auto_extracted]
+                auto_mems = [m for m in raw_page_mems if m.auto_extracted]
+                if len(auto_mems) > 1:
+                    auto_mems.sort(
+                        key=lambda m: (
+                            1 if _is_exact_memory_key(m.memory_key) else 0,
+                            max(
+                                _lexical_score(
+                                    f"{m.memory_key or ''} {m.memory_content} {m.quoted_sentence}"
+                                ),
+                                fts_mem_scores.get(m.id, 0.0),
+                            ),
+                            -(m.id or 0),
+                        ),
+                        reverse=True,
+                    )
+                if len(auto_mems) > 3:
+                    auto_mems = auto_mems[:3]
+
+                bounded_mems = [
                     self._memory_to_item(m, f_obj.file_path, p_hash, f_obj.host_node)
-                    for m in mems_by_file_page.get((file_id, page_num), [])
+                    for m in (pinned_mems + auto_mems)
                 ]
 
                 hits.append(
@@ -1713,25 +2113,37 @@ class KruschFSClient:
                         file_name=f_obj.file_name,
                         workspace=f_obj.workspace,
                         page_number=page_num,
-                        printed_page=p_obj.printed_page if p_obj else None,
+                        printed_page=p_printed,
                         citation=cand["citation"],
                         header=cand["header"],
                         locator=cand["locator"],
                         score=final_score,
                         match_source=cand["match_source"],
                         match_reasons=cand["match_reasons"],
-                        snippet=cand["snippet"],
+                        snippet=snippet,
                         bbox=cand["bbox"],
                         char_start=cand["char_start"],
                         char_end=cand["char_end"],
                         page_hash=p_hash,
-                        page_memories=page_mems,
+                        page_memories=bounded_mems,
                         handoff_repo=f_obj.handoff_repo,
                     )
                 )
 
-            hits.sort(key=lambda h: h.score, reverse=True)
-            return hits[: max(1, int(effective_limit))]
+            if limit_tokens is not None and int(limit_tokens) > 0 and len(hits) > 1:
+                max_chars = int(limit_tokens) * 4
+                budgeted_hits: List[PageSearchHit] = []
+                used_chars = 0
+                for idx, h in enumerate(hits):
+                    hit_chars = len(json.dumps(h.model_dump()))
+                    if idx == 0 or (used_chars + hit_chars) <= max_chars:
+                        budgeted_hits.append(h)
+                        used_chars += hit_chars
+                    else:
+                        break
+                return budgeted_hits
+
+            return hits
         finally:
             db.close()
 

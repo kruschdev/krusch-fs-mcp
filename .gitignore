@@ -15,4 +15,5 @@ build/
 .env
 .agent/
 *INFLIGHT*.md
+spec.md
 scratch/

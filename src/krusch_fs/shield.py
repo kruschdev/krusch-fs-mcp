@@ -220,6 +220,78 @@ def _redact_systemd_env_line(line: str) -> str:
     return f"{prefix}{redacted_rhs}"
 
 
+_SECRET_LEAK_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PRIVATE |[A-Z0-9]+ )?PRIVATE KEY-----"),
+        "PEM private key",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{16,}"),
+        "Anthropic API secret key (sk-ant-...)",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}"),
+        "API secret key (sk-...)",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])xai-[A-Za-z0-9_-]{20,}"),
+        "xAI API secret key (xai-...)",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])(?:sk|rk)_live_[A-Za-z0-9_-]{16,}"),
+        "Stripe live secret key (sk_live_/rk_live_)",
+    ),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_-])(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{22,})"
+        ),
+        "GitHub Personal Access Token",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])xox[baprs]-[A-Za-z0-9-]{16,}"),
+        "Slack API token (xox...)",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
+        "Google API key (AIza...)",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
+        "AWS Access Key ID (AKIA...)",
+    ),
+]
+_INLINE_URL_SECRET_RE = re.compile(r"://([^/\s:@]+):([^/\s:@]{6,})@")
+
+
+def scan_for_secret_leak(text: str) -> Optional[str]:
+    """
+    Inspect text for high-confidence raw secret literals prior to DB persistence (`INV-FS-BUDGET-04`).
+    Returns a descriptive reason string if a raw credential is found, or `None` if clean.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    for pattern, reason in _SECRET_LEAK_PATTERNS:
+        for match in pattern.finditer(text):
+            token = match.group(0)
+            if "REDACTED" in token.upper():
+                continue
+            return reason
+
+    for url_match in _INLINE_URL_SECRET_RE.finditer(text):
+        pwd = url_match.group(2)
+        if (
+            "REDACTED" in pwd.upper()
+            or "***" in pwd
+            or "<" in pwd
+            or (pwd.startswith("${") and pwd.endswith("}"))
+        ):
+            continue
+        return "Inline URL password"
+
+    return None
+
+
 def compute_fast_file_hash(file_path: str, size_bytes: Optional[int] = None) -> str:
     """
     Compute full SHA-256 for files <= 20MB, or a deterministic sampled SHA-256

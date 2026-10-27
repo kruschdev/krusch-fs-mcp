@@ -39,7 +39,7 @@ except ImportError:
     def ToolAnnotations(**kwargs):  # type: ignore
         return kwargs
 
-from .client import KruschFSClient
+from .client import KruschFSClient, compute_unattested_query_terms
 
 _mcp_lock = threading.Lock()
 _mcp_instance = None
@@ -110,7 +110,7 @@ WRITE_IDEMPOTENT_ANNOTATIONS = ToolAnnotations(
     description=(
         "Hybrid OS & Page-Anchored RAG search across local and fleet computers (`host_node`), KruschNexus pages, "
         "and page_memories. Returns ranked hits grounded to an exact (host_node, file_path, page_number, citation, bbox) "
-        "along with all memories pinned to that specific page."
+        "along with bounded memories pinned to that specific page and `unattested_query_terms`."
     ),
     annotations=READ_ONLY_ANNOTATIONS,
 )
@@ -124,6 +124,7 @@ def krusch_fs_search(
     include_memories: bool = True,
     limit: int = 5,
     top_k: Optional[int] = None,
+    limit_tokens: Optional[int] = None,
 ) -> str:
     """Search OS files and page-bound memories across the fleet with Dual-Clock temporal decay."""
     try:
@@ -135,12 +136,14 @@ def krusch_fs_search(
             host_node=host_node or node,
             include_memories=include_memories,
             limit=top_k if top_k is not None else limit,
+            limit_tokens=limit_tokens,
         )
         return json.dumps(
             {
                 "status": "success",
                 "count": len(hits),
                 "hits": [h.model_dump() for h in hits],
+                "unattested_query_terms": compute_unattested_query_terms(query, hits),
             },
             indent=2,
         )

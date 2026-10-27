@@ -6,4 +6,7 @@ After=network-online.target
 Type=oneshot
 Environment="KRUSCH_FS_DB_URL=sqlite:///%h/.krusch-fs/fs_memory.db"
 Environment="KRUSCH_FS_FLEET_CONFIG=%h/.krusch-fs/fleet.json"
+Environment="KRUSCH_FS_EMBED_BACKEND=ollama"
+Environment="OLLAMA_URL=http://127.0.0.1:11434"
+Environment="KRUSCH_FS_EMBED_MODEL=snowflake-arctic-embed2"
 ExecStart=krusch-fs sync-fleet
