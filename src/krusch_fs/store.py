@@ -35,6 +35,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Index,
+    TypeDecorator,
     event,
     text,
 )
@@ -57,7 +58,33 @@ except ImportError:
         if _cand and os.path.isdir(_cand) and _cand not in sys.path:
             sys.path.insert(0, _cand)
             break
-    from krusch_nexus.store import UniversalVector
+    try:
+        from krusch_nexus.store import UniversalVector
+    except ImportError:
+        class UniversalVector(TypeDecorator):  # type: ignore[no-redef]
+            impl = Text
+            cache_ok = True
+
+            def __init__(self, dim: int = 1024, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.dim = dim
+
+            def process_bind_param(self, value: Any, dialect: Any) -> Optional[str]:
+                if value is None:
+                    return None
+                if isinstance(value, (list, tuple)):
+                    return json.dumps(value)
+                return str(value)
+
+            def process_result_value(self, value: Any, dialect: Any) -> Any:
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except (ValueError, TypeError):
+                        return None
+                return value
 
 logger = logging.getLogger("krusch_fs.store")
 

@@ -183,7 +183,7 @@ def fast_hash(fpath, size_b, privacy, st_ino, st_mtime):
             h.update(f.read(65536))
             f.seek(size_b // 2)
             h.update(f.read(65536))
-    except Exception:
+    except (OSError, ValueError):
         return f"stat:{st_ino}:{size_b}:{int(st_mtime)}"
     return h.hexdigest()
 
@@ -206,7 +206,7 @@ def redact_env(fpath):
                     lines.append(ln)
                 else:
                     lines.append(f"# [REDACTED_LINE_{idx}]")
-    except Exception:
+    except (OSError, ValueError):
         pass
     return "\n".join(lines)
 

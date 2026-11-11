@@ -14,12 +14,11 @@ dependencies = [
     "pydantic>=2.0.0",
     "sqlalchemy>=2.0.25",
     "mcp>=1.0.0",
-    "krusch-nexus>=0.2.5",
 ]
 
 [project.optional-dependencies]
 krusch_nexus = [
-    "krusch-nexus>=0.2.5",
+    "krusch-nexus @ git+https://github.com/kruschdev/krusch-nexus.git",
 ]
 dev = [
     "pytest>=8.0.0",
