@@ -251,7 +251,7 @@ for raw_r in roots:
                 "text_content": text_content,
             }))
             emitted += 1
-        except Exception:
+        except (OSError, ValueError, UnicodeError):
             pass
         continue
 
@@ -401,7 +401,7 @@ for raw_r in roots:
                     "text_content": t_content,
                 }))
                 emitted += 1
-            except Exception:
+            except (OSError, ValueError, UnicodeError):
                 continue
 '''
 
