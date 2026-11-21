@@ -1,6 +1,6 @@
 # KruschFS MCP (`krusch-fs`)
 
-> **PGit + KruschNexus for Your Operating System & Multi-Node Fleet** — Standalone, opt-in OS Filesystem & Page-Anchored Memory MCP Server (`v0.3.1`).
+> **PGit + KruschNexus for Your Operating System & Multi-Node Fleet**: Standalone, opt-in OS Filesystem & Page-Anchored Memory MCP Server (`v0.3.1`).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB.svg)](pyproject.toml)

@@ -9,9 +9,12 @@ on every registered tool.
 """
 
 import json
+import logging
 import sys
 import threading
 from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 
 try:
     from mcp.server.mcpserver import MCPServer as _MCPServerClass
@@ -148,6 +151,7 @@ def krusch_fs_search(
             indent=2,
         )
     except Exception as e:
+        logger.debug("krusch_fs_search failed: %s", e, exc_info=True)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -179,6 +183,7 @@ def krusch_fs_page_tree(
             indent=2,
         )
     except Exception as e:
+        logger.debug("krusch_fs_page_tree failed for %r: %s", file_path or path, e, exc_info=True)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -216,6 +221,7 @@ def krusch_fs_read_page(
             payload = {"status": "success", "page": res.model_dump()}
         return json.dumps(payload, indent=2)
     except Exception as e:
+        logger.debug("krusch_fs_read_page failed for %r: %s", file_path or path, e, exc_info=True)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -274,6 +280,7 @@ def krusch_fs_remember_on_page(
             indent=2,
         )
     except Exception as e:
+        logger.debug("krusch_fs_remember_on_page failed for %r: %s", file_path or path, e, exc_info=True)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -321,6 +328,7 @@ def krusch_fs_locate(
             indent=2,
         )
     except Exception as e:
+        logger.debug("krusch_fs_locate failed: %s", e, exc_info=True)
         return json.dumps({"status": "error", "error": str(e)})
 
 
@@ -390,6 +398,7 @@ def krusch_fs_sync(
             }
         )
     except Exception as e:
+        logger.debug("krusch_fs_sync failed for action=%r: %s", action, e, exc_info=True)
         return json.dumps({"status": "error", "error": str(e)})
 
 

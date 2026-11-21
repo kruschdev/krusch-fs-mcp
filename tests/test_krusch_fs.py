@@ -1011,3 +1011,25 @@ def test_get_mcp_thread_safe_singleton_and_cli_validators():
         cli_main(["sync-fleet", "--nodes", "krusch;evil"])
 
 
+def test_mcp_page_tree_error_returns_structured_json_and_logs_debug(fs_env, monkeypatch, caplog):
+    import logging
+    from krusch_fs.mcp import krusch_fs_page_tree
+
+    client, root = fs_env
+
+    missing_arg_out = json.loads(krusch_fs_page_tree())
+    assert missing_arg_out == {"status": "error", "error": "file_path (or path) is required."}
+
+    def _raise_tree_error(*args, **kwargs):
+        raise RuntimeError("simulated page tree failure")
+
+    monkeypatch.setattr(client, "get_page_tree", _raise_tree_error)
+    with caplog.at_level(logging.DEBUG, logger="krusch_fs.mcp"):
+        err_out = json.loads(krusch_fs_page_tree(file_path=str(root / "missing.md")))
+
+    assert err_out["status"] == "error"
+    assert "simulated page tree failure" in err_out["error"]
+    assert any("krusch_fs_page_tree failed" in rec.message for rec in caplog.records)
+
+
+
