@@ -112,8 +112,15 @@ FLEET_NODES: Dict[str, Dict[str, Any]] = load_fleet_nodes()
 
 # Self-contained Python 3 stdlib agent executed over SSH stdin (`python3 -`) on remote fleet nodes.
 _REMOTE_SCANNER_SCRIPT_BODY = r'''
-import os, sys, json, hashlib, re
+import os, sys, json, hashlib, re, logging
 from pathlib import Path
+
+_probe_log = logging.getLogger("krusch_fs.remote_scanner")
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.DEBUG if os.environ.get("KRUSCH_FS_DEBUG") else logging.WARNING,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
 
 payload = json.loads(__PAYLOAD_JSON_STR__)
 roots = payload.get("roots", [])
@@ -309,8 +316,8 @@ for raw_r in roots:
                             "text_content": t_content,
                         }))
                         emitted += 1
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _probe_log.debug("Skipping handoff doc %s: %s", cand, exc)
             env_dirs = [cur_dir]
             proj_sub = os.path.join(cur_dir, "projects")
             if os.path.isdir(proj_sub) and not os.path.islink(proj_sub):
@@ -319,8 +326,8 @@ for raw_r in roots:
                         sp = os.path.join(proj_sub, sub)
                         if os.path.isdir(sp) and not os.path.islink(sp):
                             env_dirs.append(sp)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _probe_log.debug("Skipping project env-dir scan under %s: %s", proj_sub, exc)
             for ed in env_dirs:
                 if emitted >= max_files:
                     break
@@ -357,8 +364,8 @@ for raw_r in roots:
                                     "text_content": t_content,
                                 }))
                                 emitted += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _probe_log.debug("Skipping env scan in %s: %s", ed, exc)
             dirnames[:] = []
             continue
 
